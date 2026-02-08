@@ -1,19 +1,6 @@
-<html>
-<head>
-    <title>Financial Planner</title>
-    <link rel="stylesheet" href="styles.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/17.0.2/umd/react.production.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/17.0.2/umd/react-dom.production.min.js"></script>
-</head>
-<body>
-    <div id="root"></div>
-    <script>
-        const FinancialPlanner = () => {
-            // Your Financial Planner component logic here
-        };
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
 
-        const root = document.getElementById('root');
-        ReactDOM.render(<FinancialPlanner />, root);
-    </script>
-</body>
-</html>
+// Change from ReactDOM.createRoot to ReactDOM.render
+ReactDOM.render(<App />, document.getElementById('root'));
