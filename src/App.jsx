@@ -662,7 +662,7 @@ function project(state) {
         const capRoomAfterSgAndMatch = Math.max(0, concessionalCap - sgContrib - matchConcessional);
         taxDeductibleSacrifice = Math.min(extraConcessional, capRoomAfterSgAndMatch);
 
-        concessionalTax = concessionalWithinCap * SUPER_CONTRIB_TAX;
+        concessionalTax = totalConcessional * SUPER_CONTRIB_TAX;
 
         // Div 293: applies to within-cap concessional when (taxable income before sacrifice) + concessional > $250k
         const div293Income = grossAud + concessionalWithinCap;
@@ -675,7 +675,13 @@ function project(state) {
         nonConcessionalWithinCap = Math.min(totalNonConcessional, nonConcessionalCap);
         nonConcessionalExcess = Math.max(0, totalNonConcessional - nonConcessionalCap);
 
-        netSuperIn = concessionalWithinCap * (1 - SUPER_CONTRIB_TAX) + nonConcessionalWithinCap;
+        // Excess concessional: still hits the fund and is taxed 15% there. The personal MTR-minus-15%
+        // tax is added to taxAud below. The post-15% remainder stays in super (default ATO outcome
+        // when user doesn't issue a release authority).
+        // Excess non-concessional: already after-tax money — full amount stays in super (no penalty
+        // modelled; user assumed not to withdraw via release authority).
+        netSuperIn = (concessionalWithinCap + concessionalExcess) * (1 - SUPER_CONTRIB_TAX)
+                   + nonConcessionalWithinCap + nonConcessionalExcess;
       }
 
       // ===== Compute taxable income (now that we know the deductible sacrifice) =====
@@ -2152,24 +2158,44 @@ function CustomTooltip({ active, payload, label, events }) {
       )}
       {earnerList.some(e => (e.netSuperIn || 0) > 0) && (
         <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.line}` }}>
-          <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Super contributions</div>
+          <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Super contributions (net to fund)</div>
           {earnerList.filter(e => (e.netSuperIn || 0) > 0 || (e.totalConcessional || 0) > 0).map((e, i) => (
-            <div key={i} style={{ marginBottom: 4 }}>
+            <div key={i} style={{ marginBottom: 6 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
                 <span style={{ color: C.text }}>{e.name}</span>
                 <span className="mono" style={{ color: C.good }}>+{fmt(e.netSuperIn || 0)}</span>
               </div>
               {(e.totalConcessional || 0) > 0 && (
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.textMute, paddingLeft: 8 }}>
-                  <span>conc{e.concessionalExcess > 0 ? ` (${fmt(e.concessionalExcess)} excess)` : ""}</span>
-                  <span className="mono">{fmt(e.totalConcessional)}</span>
-                </div>
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.textMute, paddingLeft: 8 }}>
+                    <span>concessional gross</span>
+                    <span className="mono">{fmt(e.totalConcessional)}</span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.textMute, paddingLeft: 16 }}>
+                    <span>− 15% fund tax</span>
+                    <span className="mono">-{fmt(e.totalConcessional * 0.15)}</span>
+                  </div>
+                  {e.concessionalExcess > 0 && (
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.danger, paddingLeft: 16 }}>
+                      <span>over cap: {fmt(e.concessionalExcess)} (extra MTR tax personal)</span>
+                      <span className="mono">stays in fund</span>
+                    </div>
+                  )}
+                </>
               )}
               {(e.totalNonConcessional || 0) > 0 && (
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.textMute, paddingLeft: 8 }}>
-                  <span>non-conc{e.nonConcessionalExcess > 0 ? ` (${fmt(e.nonConcessionalExcess)} excess)` : ""}</span>
-                  <span className="mono">{fmt(e.totalNonConcessional)}</span>
-                </div>
+                <>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.textMute, paddingLeft: 8 }}>
+                    <span>non-concessional</span>
+                    <span className="mono">{fmt(e.totalNonConcessional)}</span>
+                  </div>
+                  {e.nonConcessionalExcess > 0 && (
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.warn || C.textMute, paddingLeft: 16 }}>
+                      <span>over cap: {fmt(e.nonConcessionalExcess)}</span>
+                      <span className="mono">stays in fund</span>
+                    </div>
+                  )}
+                </>
               )}
               {(e.div293Tax || 0) > 0 && (
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: C.danger, paddingLeft: 8 }}>
@@ -3329,11 +3355,12 @@ function TraceTab({ state, currentRow, selectedYear, setSelectedYear, projection
                     {e.extraConcessional > 0 && <TraceLine indent={2} label="salary sacrifice (concessional)" value={fmt(e.extraConcessional)} />}
                     {e.matchConcessional > 0 && <TraceLine indent={2} label="company match (concessional)" value={fmt(e.matchConcessional)} />}
                     <TraceLine indent={2} label="total concessional" value={fmt(e.totalConcessional)} subtotal />
-                    {e.concessionalExcess > 0 && <TraceLine indent={2} label="of which excess" value={fmt(e.concessionalExcess)} muted explain="not added to super; taxed at MTR" />}
-                    <TraceLine indent={2} label="− contribs tax (15%)" value={`-${fmt(e.concessionalTax)}`} negative />
+                    {e.concessionalExcess > 0 && <TraceLine indent={2} label="of which excess" value={fmt(e.concessionalExcess)} muted explain="stays in fund; extra MTR tax paid personally" />}
+                    <TraceLine indent={2} label="− 15% fund tax (on full)" value={`-${fmt(e.totalConcessional * 0.15)}`} negative />
                     {e.nonConcessional > 0 && <TraceLine indent={2} label="non-concessional (personal)" value={fmt(e.nonConcessional)} />}
                     {e.matchNonConcessional > 0 && <TraceLine indent={2} label="company match (non-conc.)" value={fmt(e.matchNonConcessional)} />}
                     {e.totalNonConcessional > 0 && <TraceLine indent={2} label="total non-concessional" value={fmt(e.totalNonConcessional)} subtotal />}
+                    {e.nonConcessionalExcess > 0 && <TraceLine indent={2} label="of which excess" value={fmt(e.nonConcessionalExcess)} muted explain="stays in fund (no penalty modelled)" />}
                     <TraceLine indent={2} label="= net into super" value={fmt(e.netSuperIn)} positive />
                   </>
                 )}
