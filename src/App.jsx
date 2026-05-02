@@ -69,7 +69,6 @@ const DEFAULT_STATE = {
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
 const VERSION = "v1.4";
-const VERSION = "1.3";
 
 // =================================================================
 // Storage layer — Supabase when authenticated, localStorage as fallback
