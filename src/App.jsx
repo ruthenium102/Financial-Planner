@@ -36,13 +36,15 @@ const CATEGORY_META = {
   property: { label: "Property", color: C.property, icon: Home },
   equities: { label: "Equities", color: C.equities, icon: TrendingUp },
   cash: { label: "Cash", color: C.cash, icon: DollarSign },
+  offset: { label: "Mortgage Offset", color: C.cash, icon: DollarSign },
   super: { label: "Superannuation", color: C.super_, icon: PiggyBank },
   sharePlan: { label: "Share Plan", color: C.sharePlan, icon: TrendingUp },
   other: { label: "Other", color: C.other, icon: Layers },
 };
 
-// Stack order (bottom to top in chart). Cash on top makes drawdown visible.
-const CATEGORY_ORDER = ["property", "super", "equities", "sharePlan", "other", "cash"];
+// Stack order (bottom to top in chart). Cash + offset on top makes drawdown visible.
+// Offsets share the cash color so they read as a single "available cash" stack visually.
+const CATEGORY_ORDER = ["property", "super", "equities", "sharePlan", "other", "cash", "offset"];
 
 // ---------- Defaults ----------
 const DEFAULT_STATE = {
@@ -66,6 +68,8 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
+const VERSION = "v1.3";
+const VERSION = "1.3";
 
 // =================================================================
 // Storage layer — Supabase when authenticated, localStorage as fallback
@@ -145,10 +149,10 @@ async function deleteFromSupabase(supabaseId) {
 // and handcrafted imports). Keeps any values already present.
 function migrateScenario(s) {
   if (!s || typeof s !== "object") return null;
-  return {
+  const out = {
     meta: { fxSgdAud: 1.15, retirementSpendingMultiplier: 0.75, ...(s.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" }) },
     assets: Array.isArray(s.assets) ? s.assets.map(a => {
-      const out = { runningExpenses: 0, earnerId: null, frankedRate: a.category === "equities" ? 100 : 0, ...a };
+      const aOut = { runningExpenses: 0, earnerId: null, frankedRate: a.category === "equities" ? 100 : 0, ...a };
       // Normalise loan(s): support legacy a.loan (single object) → a.loans (array)
       let loans = Array.isArray(a.loans) ? a.loans.slice() : [];
       if (a.loan) loans.push(a.loan);
@@ -175,9 +179,9 @@ function migrateScenario(s) {
         delete ln.annualPayment;
         return ln;
       });
-      out.loans = loans;
-      delete out.loan;
-      return out;
+      aOut.loans = loans;
+      delete aOut.loan;
+      return aOut;
     }) : [],
     liabilities: Array.isArray(s.liabilities) ? s.liabilities.map(l => {
       const out = { isInvestment: false, offsetCashAssetId: null, earnerId: null, ...l };
@@ -247,6 +251,25 @@ function migrateScenario(s) {
       ...ev,
     })) : [],
   };
+
+  // Post-process: any cash asset referenced as an offset on any loan should be
+  // converted to category "offset" with growth/income cleared. This is a one-time
+  // migration to fix the conceptual bug where cash assets earned growth AND offset
+  // mortgage interest at the same time.
+  const offsetIds = new Set();
+  out.assets.forEach(a => {
+    (a.loans || []).forEach(l => { if (l.offsetCashAssetId) offsetIds.add(l.offsetCashAssetId); });
+  });
+  out.liabilities.forEach(l => { if (l.offsetCashAssetId) offsetIds.add(l.offsetCashAssetId); });
+  if (offsetIds.size > 0) {
+    out.assets = out.assets.map(a => {
+      if (offsetIds.has(a.id) && a.category === "cash") {
+        return { ...a, category: "offset", growth: 0, income: 0, frankedRate: 0 };
+      }
+      return a;
+    });
+  }
+  return out;
 }
 
 // ---------- ATO tax (resident individual, 2025-26 FY) ----------
@@ -565,6 +588,7 @@ function project(state) {
     const assetIncomeAdjustmentByEarner = {}; // earnerId → grossed-up dividend/interest income (added to taxable)
     const frankingCreditByEarner = {};        // earnerId → franking credits to offset tax
     assets.forEach(a => {
+      if (a.category === "offset") return; // offsets earn no income
       const scale = balances[a.id] / (a.value || 1);
       const grossIncome = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
       if (a.category === "property") {
@@ -852,7 +876,11 @@ function project(state) {
 
     const netCashflow = totalNet + assetIncome + propertyCashFlow - expenses - totalLiabPayment - eventExpense - schoolFees;
 
-    assets.forEach(a => { balances[a.id] = balances[a.id] * (1 + a.growth / 100); });
+    // Asset growth — offset accounts don't grow (their benefit is reducing loan interest, not earning return)
+    assets.forEach(a => {
+      if (a.category === "offset") return;
+      balances[a.id] = balances[a.id] * (1 + a.growth / 100);
+    });
 
     earners.forEach(e => {
       const contrib = superContribByEarner[e.id];
@@ -898,7 +926,7 @@ function project(state) {
       else if (cashAssets.length > 0) balances[cashAssets[0].id] += eventLump;
     }
 
-    const byCat = { property: 0, equities: 0, cash: 0, super: 0, sharePlan: 0, other: 0 };
+    const byCat = { property: 0, equities: 0, cash: 0, offset: 0, super: 0, sharePlan: 0, other: 0 };
     assets.forEach(a => { byCat[a.category] = (byCat[a.category] || 0) + balances[a.id]; });
     const totalAssets = Object.values(byCat).reduce((s, v) => s + v, 0);
     const totalLiab = Object.values(liabs).reduce((s, v) => s + v, 0);
@@ -1284,7 +1312,7 @@ export default function FinancialPlanner() {
       console.error("Projection error:", e);
       return [{
         year: 0, age: state.meta?.currentAge || 45,
-        property: 0, equities: 0, cash: 0, super: 0, sharePlan: 0, other: 0,
+        property: 0, equities: 0, cash: 0, offset: 0, super: 0, sharePlan: 0, other: 0,
         totalAssets: 0, liabilities: 0, netWealth: 0, netCashflow: 0,
         totalGross: 0, totalNet: 0, totalTax: 0, expenses: 0, expenseBreakdown: {},
         schoolFees: 0, earnerBreakdown: {}, feesByKid: {},
@@ -1479,6 +1507,11 @@ export default function FinancialPlanner() {
     setState(s => ({ ...s, assets: [...s.assets, { id, name: "New asset", category: "cash", value: 10000, growth: 4, income: 0 }] }));
     setEditingAsset(id);
   };
+  const addOffset = () => {
+    const id = `a${Date.now()}`;
+    setState(s => ({ ...s, assets: [...s.assets, { id, name: "Offset account", category: "offset", value: 0, growth: 0, income: 0 }] }));
+    setEditingAsset(id);
+  };
   const addSuper = () => {
     const id = `a${Date.now()}`;
     setState(s => ({ ...s, assets: [...s.assets, { id, name: "Super", category: "super", value: 0, growth: 7, income: 0 }] }));
@@ -1598,7 +1631,10 @@ export default function FinancialPlanner() {
 
       <header style={{ borderBottom: `1px solid ${C.line}`, padding: "20px 32px", display: "flex", alignItems: "center", justifyContent: "space-between", background: `linear-gradient(180deg, ${C.panel} 0%, ${C.bg} 100%)`, flexWrap: "wrap", gap: 16 }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 18 }}>
-          <div className="serif" style={{ fontSize: 26, fontWeight: 500, letterSpacing: "-0.01em", fontStyle: "italic" }}>The Ledger</div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+            <div className="serif" style={{ fontSize: 26, fontWeight: 500, letterSpacing: "-0.01em", fontStyle: "italic" }}>The Ledger</div>
+            <div className="mono" style={{ fontSize: 10, color: C.textMute, letterSpacing: "0.1em", opacity: 0.6 }}>{VERSION}</div>
+          </div>
           <div style={{ color: C.textMute, fontSize: 11, letterSpacing: "0.2em", textTransform: "uppercase" }}>Long-range financial scenarios</div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
@@ -1928,7 +1964,7 @@ export default function FinancialPlanner() {
               getKey={(a) => a.id}
               onReorder={(next) => reorderAssets((a) => a.category === "super", next)}
               render={(a) => (
-                <AssetRow a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                <AssetRow a={a} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
                   editing={editingAsset === a.id}
                   onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
                   onChange={(patch) => updateAsset(a.id, patch)}
@@ -1938,13 +1974,13 @@ export default function FinancialPlanner() {
             />
           </Section>
 
-          <Section title="Assets" subtitle="Property · equities · cash · other" onAdd={addAsset} bordered>
+          <Section title="Assets" subtitle="Property · equities · cash · offset · other" onAdd={addAsset} bordered>
             <DragList
               items={state.assets.filter(a => a.category !== "super")}
               getKey={(a) => a.id}
               onReorder={(next) => reorderAssets((a) => a.category !== "super", next)}
               render={(a) => (
-                <AssetRow a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                <AssetRow a={a} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
                   editing={editingAsset === a.id}
                   onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
                   onChange={(patch) => updateAsset(a.id, patch)}
@@ -1952,6 +1988,9 @@ export default function FinancialPlanner() {
                 />
               )}
             />
+            <button onClick={addOffset} className="fp-btn" style={{ ...btnGhost, marginTop: 8, fontSize: 11 }}>
+              <Plus size={11} /> Add Mortgage Offset
+            </button>
           </Section>
 
           <Section title="School fees" subtitle="Per child · fees grow annually" onAdd={addKid} bordered>
@@ -1992,7 +2031,7 @@ export default function FinancialPlanner() {
               getKey={(l) => l.id}
               onReorder={reorderLiabilities}
               render={(l) => (
-                <LiabRow l={l} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                <LiabRow l={l} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
                   editing={editingLiab === l.id}
                   onEdit={() => setEditingLiab(editingLiab === l.id ? null : l.id)}
                   onChange={(patch) => updateLiab(l.id, patch)}
@@ -2621,10 +2660,11 @@ function ExpenseRow({ x, maxYear, currentAge, editing, onEdit, onChange, onRemov
   );
 }
 
-function AssetRow({ a, earners, cashAssets = [], editing, onEdit, onChange, onRemove }) {
+function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, onRemove }) {
   const meta = CATEGORY_META[a.category];
   const earnerName = a.earnerId ? earners.find(e => e.id === a.earnerId)?.name : null;
   const isProperty = a.category === "property";
+  const isOffset = a.category === "offset";
   // Normalise loans: support legacy a.loan by folding it into a.loans
   const loans = Array.isArray(a.loans)
     ? a.loans
@@ -2664,8 +2704,8 @@ function AssetRow({ a, earners, cashAssets = [], editing, onEdit, onChange, onRe
             <div className="mono" style={{ fontSize: 12, color: C.text }}>{fmt(a.value)}</div>
           </div>
           <div className="mono" style={{ fontSize: 10, color: C.textMute, marginTop: 2 }}>
-            {meta.label} · {a.growth}% growth
-            {a.income > 0 && ` · ${fmt(a.income)}/yr income`}
+            {meta.label}{!isOffset && ` · ${a.growth}% growth`}
+            {!isOffset && a.income > 0 && ` · ${fmt(a.income)}/yr income`}
             {earnerName && ` · ${earnerName}`}
           </div>
           {loans.filter(l => l.balance > 0).map((l, i) => (
@@ -2690,9 +2730,14 @@ function AssetRow({ a, earners, cashAssets = [], editing, onEdit, onChange, onRe
             </select>
           </MiniField>
           <MiniField label="Value"><NumberInput value={a.value} onChange={(v) => onChange({ value: v })} style={miniInput} /></MiniField>
-          <MiniField label="Growth %"><NumberInput step={0.1} value={a.growth} onChange={(v) => onChange({ growth: v })} style={miniInput} /></MiniField>
-          <MiniField label="Annual income"><NumberInput value={a.income} onChange={(v) => onChange({ income: v })} style={miniInput} /></MiniField>
-          {a.income > 0 && a.category !== "property" && a.category !== "super" && (
+          {!isOffset && <MiniField label="Growth %"><NumberInput step={0.1} value={a.growth} onChange={(v) => onChange({ growth: v })} style={miniInput} /></MiniField>}
+          {!isOffset && <MiniField label="Annual income"><NumberInput value={a.income} onChange={(v) => onChange({ income: v })} style={miniInput} /></MiniField>}
+          {isOffset && (
+            <div style={{ gridColumn: "1 / -1", fontSize: 10, color: C.textMute, padding: "8px 10px", background: C.bg, border: `1px solid ${C.line}`, marginTop: 4 }}>
+              Offset accounts don't earn growth or income. Their benefit is reducing loan interest. Link this asset to a loan via the loan's "Offset from" field.
+            </div>
+          )}
+          {!isOffset && a.income > 0 && a.category !== "property" && a.category !== "super" && (
             <>
               <MiniField label="Franked %">
                 <NumberInput step={5} value={a.frankedRate ?? (a.category === "equities" || a.category === "sharePlan" ? 100 : 0)} onChange={(v) => onChange({ frankedRate: v })} style={miniInput} />
@@ -2771,10 +2816,10 @@ function AssetRow({ a, earners, cashAssets = [], editing, onEdit, onChange, onRe
                           <option value="yes">Yes (interest deductible)</option>
                         </select>
                       </MiniField>
-                      <MiniField label="Offset cash from">
+                      <MiniField label="Offset from">
                         <select value={loan.offsetCashAssetId || ""} onChange={e => updateLoan(loan.id, { offsetCashAssetId: e.target.value || null })} style={miniInput}>
                           <option value="">— no offset —</option>
-                          {cashAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                          {offsetAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                         </select>
                       </MiniField>
                       <div style={{ gridColumn: "1 / -1" }}>
@@ -2795,7 +2840,7 @@ function AssetRow({ a, earners, cashAssets = [], editing, onEdit, onChange, onRe
   );
 }
 
-function LiabRow({ l, earners = [], cashAssets = [], editing, onEdit, onChange, onRemove }) {
+function LiabRow({ l, earners = [], offsetAssets = [], editing, onEdit, onChange, onRemove }) {
   const ref = useClickOutside(editing, () => onEdit());
   const loanAnnual = computeAnnualPayment(l);
   const type = l.type || "pi";
@@ -2852,10 +2897,10 @@ function LiabRow({ l, earners = [], cashAssets = [], editing, onEdit, onChange, 
               </select>
             </MiniField>
           )}
-          <MiniField label="Offset cash from">
+          <MiniField label="Offset from">
             <select value={l.offsetCashAssetId || ""} onChange={e => onChange({ offsetCashAssetId: e.target.value || null })} style={miniInput}>
               <option value="">— no offset —</option>
-              {cashAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              {offsetAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
           </MiniField>
           <div>
@@ -3529,8 +3574,11 @@ function AuthView({ onSignedIn }) {
         maxWidth: 380, width: "100%",
       }}>
         <div style={{ marginBottom: 24, textAlign: "center" }}>
-          <div className="serif" style={{ fontSize: 30, fontStyle: "italic", fontWeight: 500, letterSpacing: "-0.01em" }}>
-            The Ledger
+          <div style={{ display: "inline-flex", alignItems: "baseline", gap: 10 }}>
+            <div className="serif" style={{ fontSize: 30, fontStyle: "italic", fontWeight: 500, letterSpacing: "-0.01em" }}>
+              The Ledger
+            </div>
+            <div className="mono" style={{ fontSize: 10, color: C.textMute, letterSpacing: "0.1em", opacity: 0.6 }}>{VERSION}</div>
           </div>
           <div style={{ color: C.textMute, fontSize: 10, letterSpacing: "0.2em", textTransform: "uppercase", marginTop: 6 }}>
             Long-range financial scenarios
