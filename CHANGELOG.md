@@ -4,6 +4,36 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.4 — 2 May 2026
+
+**Joint asset ownership**
+- Each non-cash, non-super asset can now be jointly owned by multiple earners.
+- New ownership editor in the asset edit form: a small grid showing each earner with a percentage input. Total must sum to 100%.
+- Tax and cashflow attribution (rental income, running expenses, investment loan interest deduction, dividends, franking credits, asset interest income) now distributes across owners according to their percentage shares.
+- Helper buttons: "Split evenly" (when 2+ earners) and "100% to [name]" (when single earner).
+- Migration: existing assets with `earnerId` set are converted to `ownershipShares: { [earnerId]: 100 }`. No manual rework needed.
+
+**Yield-based equity income**
+- Equities and Share Plan assets now use a "Dividend yield %" field instead of a flat $ income.
+- Income each year is computed as `balance × yield`, so dividends naturally grow with the portfolio.
+- "Fully franked?" dropdown (Yes / No / Partial) replaces the Franked % field for the common cases. Choosing "Partial" reveals the % input for unusual portfolios.
+- Migration: existing assets with `income > 0` and `value > 0` get `dividendYield = income / value × 100`. New equities default to 4% yield, share plans to 0%.
+
+**MLS calculation overhaul (per ATO 2025–26)**
+- Updated thresholds to current ATO numbers:
+  - Single: $101,000 / $118,000 / $158,000
+  - Family: $202,000 / $236,000 / $316,000
+- Family threshold now uplifts by $1,500 for each dependent child after the first (per ATO).
+- MLS-purposes income now correctly distinct from taxable income — adds back deductible salary sacrifice and negative gearing losses, both of which the ATO requires.
+- Result: a salary-sacrificing high earner without private health will now see materially higher MLS than before, matching real-life tax assessment.
+
+**"SG" renamed to "Super Guarantee"**
+- All UI labels: earner edit form, Logic tab Super card, Trace tab.
+- Internal field names (`superSgRate`, `superSgIncludesBonus`) unchanged — code-level rename not needed.
+- Removes confusion with "SG" used elsewhere as the country code for Singapore.
+
+---
+
 ## v1.3 — 2 May 2026
 
 **Mortgage Offset asset category**

@@ -68,7 +68,8 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.3";
+const VERSION = "v1.4";
+const VERSION = "1.3";
 
 // =================================================================
 // Storage layer — Supabase when authenticated, localStorage as fallback
@@ -152,6 +153,26 @@ function migrateScenario(s) {
     meta: { fxSgdAud: 1.15, retirementSpendingMultiplier: 0.75, ...(s.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" }) },
     assets: Array.isArray(s.assets) ? s.assets.map(a => {
       const aOut = { runningExpenses: 0, earnerId: null, frankedRate: a.category === "equities" ? 100 : 0, ...a };
+      // Convert flat income → dividendYield for equities and sharePlan (% of value)
+      if ((aOut.category === "equities" || aOut.category === "sharePlan") && aOut.dividendYield == null) {
+        if (aOut.income > 0 && aOut.value > 0) {
+          aOut.dividendYield = (aOut.income / aOut.value) * 100;
+        } else {
+          aOut.dividendYield = aOut.category === "equities" ? 4 : 0;
+        }
+        // Clear flat income — yield-based now
+        aOut.income = 0;
+      }
+      // Joint ownership migration: convert legacy earnerId → ownershipShares
+      // If ownershipShares already set, leave it. Otherwise, default to 100% to current earnerId
+      // (or empty object if no earnerId — engine falls back to first AUD earner)
+      if (!aOut.ownershipShares) {
+        if (aOut.earnerId) {
+          aOut.ownershipShares = { [aOut.earnerId]: 100 };
+        } else {
+          aOut.ownershipShares = {};
+        }
+      }
       // Normalise loan(s): support legacy a.loan (single object) → a.loans (array)
       let loans = Array.isArray(a.loans) ? a.loans.slice() : [];
       if (a.loan) loans.push(a.loan);
@@ -166,8 +187,6 @@ function migrateScenario(s) {
           }
         }
         if (!ln.termYears) ln.termYears = 30;
-        // For IO loans: if no ioPeriod set, treat the existing termYears as the IO period and bump
-        // the total term to 30y so the post-IO P&I phase amortises over a sensible window.
         if (ln.type === "io" && ln.ioPeriod == null) {
           ln.ioPeriod = ln.termYears;
           if (ln.termYears < 30) ln.termYears = 30;
@@ -284,30 +303,33 @@ const ATO_BRACKETS_2025_26 = [
 const MEDICARE_LEVY_RATE = 0.02;
 
 // Medicare Levy Surcharge (2025-26 thresholds) — applies if no private hospital cover.
-// Tier 1: 1.0% on income above $97,000 (single) / $194,000 (family)
-// Tier 2: 1.25% above $113,000 / $226,000
-// Tier 3: 1.5% above $151,000 / $302,000
-// Source: ATO, verified Apr 2026
+// Tier 1: 1.0% on income above $101,000 (single) / $202,000 (family)
+// Tier 2: 1.25% above $118,000 / $236,000
+// Tier 3: 1.5% above $158,000 / $316,000
+// Family threshold is increased by $1,500 for EACH dependent child after the first.
+// Source: ATO, verified May 2026 — https://www.ato.gov.au/individuals-and-families/medicare-and-private-health-insurance/medicare-levy-surcharge/medicare-levy-surcharge-income-thresholds-and-rates
 const MLS_TIERS = {
   single: [
-    { threshold: 97000,  rate: 0.000 },
-    { threshold: 113001, rate: 0.010 },
-    { threshold: 151001, rate: 0.0125 },
+    { threshold: 101000, rate: 0.000 },
+    { threshold: 118001, rate: 0.010 },
+    { threshold: 158001, rate: 0.0125 },
     { threshold: Infinity, rate: 0.015 },
   ],
   family: [
-    { threshold: 194000, rate: 0.000 },
-    { threshold: 226001, rate: 0.010 },
-    { threshold: 302001, rate: 0.0125 },
+    { threshold: 202000, rate: 0.000 },
+    { threshold: 236001, rate: 0.010 },
+    { threshold: 316001, rate: 0.0125 },
     { threshold: Infinity, rate: 0.015 },
   ],
 };
-function medicareLevySurcharge(income, isFamily = false) {
+const MLS_KID_UPLIFT = 1500;  // +$1,500 per kid AFTER the first
+function medicareLevySurcharge(income, isFamily = false, dependentKids = 0) {
   // Returns the MLS rate that applies at this income level
   const tiers = isFamily ? MLS_TIERS.family : MLS_TIERS.single;
+  const uplift = isFamily && dependentKids > 1 ? (dependentKids - 1) * MLS_KID_UPLIFT : 0;
   let rate = 0;
   for (const t of tiers) {
-    if (income < t.threshold) break;
+    if (income < (t.threshold + uplift)) break;
     rate = t.rate;
   }
   return income * rate;
@@ -325,20 +347,24 @@ function atoIncomeTax(taxableIncome) {
 }
 
 // ATO total tax = income tax + Medicare Levy + (optional) Medicare Levy Surcharge.
-// `hasPrivateHealth` (default true) suppresses MLS. `householdIncome` used for MLS family thresholds
-// when modelling a couple — pass undefined to use single thresholds.
-function atoTotalTax(taxableIncome, hasPrivateHealth = true, householdIncome = undefined) {
+// `hasPrivateHealth` (default true) suppresses MLS. `householdMlsIncome` is the household's
+// MLS-purposes income (taxable + reportable super contribs + net investment losses + reportable FBT),
+// used as the basis for MLS family threshold checks. `dependentKids` is the count of kids still in
+// dependant period, used for the +$1,500-per-additional-kid family threshold uplift.
+// `mlsIncome` is the individual's own MLS-purposes income (used as the *amount* MLS is applied to).
+function atoTotalTax(taxableIncome, hasPrivateHealth = true, householdMlsIncome = undefined, dependentKids = 0, mlsIncome = undefined) {
   if (taxableIncome <= 0) return 0;
   let tax = atoIncomeTax(taxableIncome);
   if (taxableIncome > 27222) tax += taxableIncome * MEDICARE_LEVY_RATE;
   if (!hasPrivateHealth) {
-    const isFamily = householdIncome != null && householdIncome > taxableIncome;
-    const incomeForMls = householdIncome ?? taxableIncome;
-    // MLS rate determined by household income for couples, applied to the individual's income
+    const isFamily = householdMlsIncome != null && householdMlsIncome > (mlsIncome ?? taxableIncome);
+    const incomeForMlsCheck = householdMlsIncome ?? mlsIncome ?? taxableIncome;
     const tiers = isFamily ? MLS_TIERS.family : MLS_TIERS.single;
+    const uplift = isFamily && dependentKids > 1 ? (dependentKids - 1) * MLS_KID_UPLIFT : 0;
     let rate = 0;
-    for (const t of tiers) { if (incomeForMls < t.threshold) break; rate = t.rate; }
-    tax += taxableIncome * rate;
+    for (const t of tiers) { if (incomeForMlsCheck < (t.threshold + uplift)) break; rate = t.rate; }
+    // MLS is applied to the individual's MLS income (or fall back to taxable income)
+    tax += (mlsIncome ?? taxableIncome) * rate;
   }
   return tax;
 }
@@ -377,12 +403,13 @@ function sgIncomeTax(taxableIncome) {
 // Compute tax for an earner based on their tax mode and currency context.
 // `gross` is the taxable income (already net of any salary sacrifice for ATO earners).
 // Returns tax in the EARNER'S currency (so for SG earners, returns SGD tax).
-function computeEarnerTax(earner, gross, householdAtoIncome = undefined) {
+// `householdMlsIncome` and `mlsIncome` are MLS-purposes income (add-backs included).
+// `dependentKids` is the number of kids still in dependant period (for family threshold uplift).
+function computeEarnerTax(earner, gross, householdMlsIncome = undefined, dependentKids = 0, mlsIncome = undefined) {
   const mode = earner.taxMode || "ato";
   if (mode === "flat") return gross * ((earner.taxRate || 0) / 100);
   if (mode === "sg")   return sgIncomeTax(gross);
-  // ATO: include MLS if no private health
-  return atoTotalTax(gross, earner.hasPrivateHealth !== false, householdAtoIncome);
+  return atoTotalTax(gross, earner.hasPrivateHealth !== false, householdMlsIncome, dependentKids, mlsIncome);
 }
 
 // ---------- Super contribution caps (FY2025-26) ----------
@@ -532,6 +559,25 @@ function project(state) {
       interestThisYear[key] = effectiveBalance * (m.rate / 100);
     });
 
+    // Helper: distribute an amount across earners according to an asset's ownershipShares.
+    // Falls back to first AUD ATO earner if shares are empty/missing.
+    const distributeByOwnership = (asset, amount, accumulator) => {
+      const shares = asset?.ownershipShares || {};
+      const validEntries = Object.entries(shares).filter(([eid, pct]) => earners.some(e => e.id === eid) && pct > 0);
+      if (validEntries.length > 0) {
+        const totalPct = validEntries.reduce((s, [, p]) => s + p, 0);
+        validEntries.forEach(([eid, pct]) => {
+          accumulator[eid] = (accumulator[eid] || 0) + amount * (pct / totalPct);
+        });
+        return;
+      }
+      // Fallback: legacy earnerId or first AUD earner
+      const fallback = asset?.earnerId
+        || earners.find(en => (en.currency || "AUD") === "AUD" && (en.taxMode || "ato") === "ato" && !earnerState[en.id].retired)?.id
+        || earners[0]?.id;
+      if (fallback) accumulator[fallback] = (accumulator[fallback] || 0) + amount;
+    };
+
     // Second pass: per-asset rental result for properties with investment loans
     // Rental income comes from a.income; running expenses from a.runningExpenses.
     // Sum of investment-loan interest attributed to this property reduces the rental result.
@@ -549,20 +595,14 @@ function project(state) {
         }
       });
       const netRental = grossRental - runningExp - propertyInvestmentInterest;
-      // Attribute to the asset's earner (or first AUD earner if not set)
-      const ownerId = a.earnerId
-        || (Object.keys(loanMeta).find(k => loanMeta[k].assetId === a.id && loanMeta[k].earnerId) && loanMeta[Object.keys(loanMeta).find(k => loanMeta[k].assetId === a.id && loanMeta[k].earnerId)].earnerId)
-        || (earners.find(e => (e.currency || "AUD") === "AUD" && !earnerState[e.id].retired)?.id)
-        || earners[0]?.id;
-      if (ownerId) {
-        rentalAdjustmentByEarner[ownerId] = (rentalAdjustmentByEarner[ownerId] || 0) + netRental;
-      }
+      // Distribute across owners by their ownership shares
+      distributeByOwnership(a, netRental, rentalAdjustmentByEarner);
       totalRentalIncome += grossRental;
       totalRentalExpenses += runningExp;
       totalInvestmentInterest += propertyInvestmentInterest;
     });
 
-    // Standalone investment debts (non-property): interest is also deductible to the loan's earner
+    // Standalone investment debts (non-property): interest is deductible to the loan's earner
     Object.keys(loanMeta).forEach(key => {
       const m = loanMeta[key];
       if (m.assetId) return; // already handled above (attached to a property)
@@ -582,27 +622,34 @@ function project(state) {
     const shareBonusByEarner = {};      // share bonus value (AUD) routed to share plan asset
 
     // ===== Asset income (non-property): attribute to owner-earner for tax =====
-    let assetIncome = 0;        // non-property cash income (entered by household)
-    let propertyCashFlow = 0;   // property rental − running expenses (interest paid via totalLiabPayment)
+    // Equities and sharePlan use dividendYield (% of value). Other categories use flat income.
+    let assetIncome = 0;
+    let propertyCashFlow = 0;
     const assetIncomeAdjustmentByEarner = {}; // earnerId → grossed-up dividend/interest income (added to taxable)
     const frankingCreditByEarner = {};        // earnerId → franking credits to offset tax
     assets.forEach(a => {
       if (a.category === "offset") return; // offsets earn no income
-      const scale = balances[a.id] / (a.value || 1);
-      const grossIncome = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
+      // Compute gross income for this asset
+      let grossIncome;
+      if (a.category === "equities" || a.category === "sharePlan") {
+        // Yield-based: % of current balance
+        grossIncome = (balances[a.id] || 0) * ((a.dividendYield || 0) / 100);
+      } else {
+        // Flat income, scaled if balance has changed since input value
+        const scale = balances[a.id] / (a.value || 1);
+        grossIncome = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
+      }
       if (a.category === "property") {
         const runningExp = (a.runningExpenses || 0);
         propertyCashFlow += grossIncome - runningExp;
       } else if (grossIncome > 0) {
         assetIncome += grossIncome;
-        const ownerId = a.earnerId || (earners.find(en => (en.currency || "AUD") === "AUD" && (en.taxMode || "ato") === "ato" && !earnerState[en.id].retired)?.id);
-        if (ownerId) {
-          const frankedPct = (a.frankedRate || 0) / 100;
-          const grossedUp = grossIncome + grossIncome * frankedPct * (30 / 70);
-          const frankingCredit = grossIncome * frankedPct * (30 / 70);
-          assetIncomeAdjustmentByEarner[ownerId] = (assetIncomeAdjustmentByEarner[ownerId] || 0) + grossedUp;
-          frankingCreditByEarner[ownerId] = (frankingCreditByEarner[ownerId] || 0) + frankingCredit;
-        }
+        // Distribute across owners by ownership shares
+        const frankedPct = (a.frankedRate || 0) / 100;
+        const grossedUp = grossIncome + grossIncome * frankedPct * (30 / 70);
+        const frankingCredit = grossIncome * frankedPct * (30 / 70);
+        distributeByOwnership(a, grossedUp, assetIncomeAdjustmentByEarner);
+        if (frankingCredit > 0) distributeByOwnership(a, frankingCredit, frankingCreditByEarner);
       }
     });
 
@@ -623,6 +670,55 @@ function project(state) {
         cgtAdjustmentByEarner[ownerId] = (cgtAdjustmentByEarner[ownerId] || 0) + discountedGain;
       }
     });
+
+    // Pre-compute per-earner deductible salary sacrifice (needed for MLS add-back later).
+    // This duplicates a small piece of the main earner loop's logic, but doing it here lets us
+    // compute MLS income before the main tax computation.
+    const deductibleSacrificeByEarner = {};
+    earners.forEach(e => {
+      const st = earnerState[e.id];
+      if (st.retired || (e.currency || "AUD") !== "AUD") { deductibleSacrificeByEarner[e.id] = 0; return; }
+      const base = st.salary;
+      const bonusCash = base * ((e.bonusRateCash || 0) / 100);
+      const bonusShares = base * ((e.bonusRateShares || 0) / 100);
+      const grossAud = base + bonusCash + bonusShares;
+      const sgBase = (e.superSgIncludesBonus ? grossAud : base);
+      const sgContrib = sgBase * ((e.superSgRate ?? 12) / 100);
+      const matchConcessional = grossAud * ((e.superMatchConcessionalRate || 0) / 100);
+      const extraConcessional = grossAud * ((e.superExtraConcessionalRate || 0) / 100);
+      const capRoom = Math.max(0, concessionalCap - sgContrib - matchConcessional);
+      deductibleSacrificeByEarner[e.id] = Math.min(extraConcessional, capRoom);
+    });
+
+    // Pre-compute household MLS income for family thresholds.
+    // ATO definition of MLS income: taxable income + reportable super contribs (deductible sal-sac)
+    //   + net investment losses (added back when negative) + (we don't model FBT or trust dist).
+    // MLS income per earner = taxable + deductible sal-sac (added back) + max(0, -rentalAdj) (negative
+    //   gearing losses added back). Asset income and CGT are already in taxable.
+    const mlsIncomeByEarner = {};
+    let householdMlsIncome = 0;
+    earners.forEach(e => {
+      const st = earnerState[e.id];
+      if (st.retired || (e.currency || "AUD") !== "AUD" || (e.taxMode || "ato") !== "ato") {
+        mlsIncomeByEarner[e.id] = 0;
+        return;
+      }
+      const base = st.salary;
+      const bonus = base * (((e.bonusRateCash || 0) + (e.bonusRateShares || 0)) / 100);
+      const rentalAdj = rentalAdjustmentByEarner[e.id] || 0;
+      const assetAdj = assetIncomeAdjustmentByEarner[e.id] || 0;
+      const cgtAdj = cgtAdjustmentByEarner[e.id] || 0;
+      const taxableForMls = base + bonus - (deductibleSacrificeByEarner[e.id] || 0) + rentalAdj + assetAdj + cgtAdj;
+      // Add back: deductible sacrifice + abs of any negative rental
+      const addBackSacrifice = deductibleSacrificeByEarner[e.id] || 0;
+      const addBackInvestmentLoss = rentalAdj < 0 ? -rentalAdj : 0;
+      const mlsIncome = Math.max(0, taxableForMls) + addBackSacrifice + addBackInvestmentLoss;
+      mlsIncomeByEarner[e.id] = mlsIncome;
+      householdMlsIncome += mlsIncome;
+    });
+
+    // Count of dependent kids in this year (for MLS family threshold uplift)
+    const dependentKidsThisYear = kids.filter(k => kidState[k.id]?.yearsRemaining > 0).length;
 
     // Pre-compute household income for MLS family thresholds (sum of all AUD ATO earners, after rental adj)
     let householdAtoIncome = 0;
@@ -718,15 +814,16 @@ function project(state) {
       const taxableLocal = (currency === "AUD")
         ? (grossLocal - taxDeductibleSacrifice / fx + (rentalAdj + assetAdj + cgtAdj) / fx)
         : grossLocal;
-      const taxLocalBeforeFranking = computeEarnerTax(e, taxableLocal, currency === "AUD" ? householdAtoIncome : undefined);
+      const earnerMlsIncome = isAudAto ? (mlsIncomeByEarner[e.id] || 0) : undefined;
+      const taxLocalBeforeFranking = computeEarnerTax(e, taxableLocal, currency === "AUD" ? householdMlsIncome : undefined, dependentKidsThisYear, earnerMlsIncome);
       // Franking credits offset tax 1-for-1 (refundable for low-income; here we cap at total tax for simplicity)
       const taxLocal = Math.max(0, taxLocalBeforeFranking - frankingCredit / fx);
 
       let taxAud = taxLocal * fx;
       // Excess concessional: on ATO earners, taxed at marginal rate over and above the 15% contribs tax
       if (concessionalExcess > 0 && (e.taxMode || "ato") === "ato") {
-        const taxAtGross = atoTotalTax(taxableLocal * fx, e.hasPrivateHealth !== false, householdAtoIncome);
-        const taxAtPlus1k = atoTotalTax(taxableLocal * fx + 1000, e.hasPrivateHealth !== false, householdAtoIncome);
+        const taxAtGross = atoTotalTax(taxableLocal * fx, e.hasPrivateHealth !== false, householdMlsIncome, dependentKidsThisYear, earnerMlsIncome);
+        const taxAtPlus1k = atoTotalTax(taxableLocal * fx + 1000, e.hasPrivateHealth !== false, householdMlsIncome, dependentKidsThisYear, earnerMlsIncome);
         const mtr = (taxAtPlus1k - taxAtGross) / 1000;
         excessConcessionalTax = concessionalExcess * Math.max(0, mtr - SUPER_CONTRIB_TAX);
       } else if (concessionalExcess > 0) {
@@ -2507,10 +2604,10 @@ function EarnerRow({ e, currentRow, editing, onEdit, onChange, onRemove, canRemo
                 </div>
               </div>
               {/* Row 1: SG % | SG includes bonus toggle */}
-              <MiniField label="Super guarantee %">
+              <MiniField label="Super Guarantee %">
                 <NumberInput step={0.1} value={e.superSgRate ?? 12} onChange={(v) => onChange({ superSgRate: v })} style={miniInput} />
               </MiniField>
-              <MiniField label="SG calculated on">
+              <MiniField label="Super Guarantee calculated on">
                 <select value={e.superSgIncludesBonus ? "gross" : "base"} onChange={ev => onChange({ superSgIncludesBonus: ev.target.value === "gross" })} style={miniInput}>
                   <option value="base">Base salary only (default)</option>
                   <option value="gross">Base + bonus</option>
@@ -2542,7 +2639,7 @@ function EarnerRow({ e, currentRow, editing, onEdit, onChange, onRemove, canRemo
                       </span>
                     </div>
                     <div style={{ display: "flex", justifyContent: "space-between", color: C.textMute, fontSize: 10, paddingLeft: 8 }}>
-                      <span>SG · sal-sac · match</span>
+                      <span>Super Guarantee · sal-sac · match</span>
                       <span>{fmt(br.sgContrib)} · {fmt(br.extraConcessional)} · {fmt(br.totalConcessional - br.sgContrib - br.extraConcessional)}</span>
                     </div>
                     {br.concessionalTax > 0 && (
@@ -2730,24 +2827,54 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
           </MiniField>
           <MiniField label="Value"><NumberInput value={a.value} onChange={(v) => onChange({ value: v })} style={miniInput} /></MiniField>
           {!isOffset && <MiniField label="Growth %"><NumberInput step={0.1} value={a.growth} onChange={(v) => onChange({ growth: v })} style={miniInput} /></MiniField>}
-          {!isOffset && <MiniField label="Annual income"><NumberInput value={a.income} onChange={(v) => onChange({ income: v })} style={miniInput} /></MiniField>}
+          {/* Income field varies by category */}
+          {!isOffset && (a.category === "equities" || a.category === "sharePlan") && (
+            <MiniField label="Dividend yield %">
+              <NumberInput step={0.1} value={a.dividendYield ?? (a.category === "equities" ? 4 : 0)} onChange={(v) => onChange({ dividendYield: v })} style={miniInput} />
+            </MiniField>
+          )}
+          {!isOffset && a.category !== "equities" && a.category !== "sharePlan" && (
+            <MiniField label="Annual income"><NumberInput value={a.income} onChange={(v) => onChange({ income: v })} style={miniInput} /></MiniField>
+          )}
           {isOffset && (
             <div style={{ gridColumn: "1 / -1", fontSize: 10, color: C.textMute, padding: "8px 10px", background: C.bg, border: `1px solid ${C.line}`, marginTop: 4 }}>
               Offset accounts don't earn growth or income. Their benefit is reducing loan interest. Link this asset to a loan via the loan's "Offset from" field.
             </div>
           )}
-          {!isOffset && a.income > 0 && a.category !== "property" && a.category !== "super" && (
+          {/* Franking — for equities/sharePlan with yield, OR other assets with positive flat income */}
+          {!isOffset && ((a.category === "equities" || a.category === "sharePlan") ? (a.dividendYield ?? 0) > 0 : (a.income > 0 && a.category !== "property" && a.category !== "super")) && (
             <>
-              <MiniField label="Franked %">
-                <NumberInput step={5} value={a.frankedRate ?? (a.category === "equities" || a.category === "sharePlan" ? 100 : 0)} onChange={(v) => onChange({ frankedRate: v })} style={miniInput} />
-              </MiniField>
-              <MiniField label="Held by (for tax)">
-                <select value={a.earnerId || ""} onChange={e => onChange({ earnerId: e.target.value || null })} style={miniInput}>
-                  <option value="">— first AUD earner —</option>
-                  {earners.map(en => <option key={en.id} value={en.id}>{en.name}</option>)}
+              <MiniField label="Fully franked?">
+                <select value={(a.frankedRate ?? 0) === 100 ? "yes" : (a.frankedRate ?? 0) === 0 ? "no" : "partial"} onChange={ev => {
+                  const v = ev.target.value;
+                  if (v === "yes") onChange({ frankedRate: 100 });
+                  else if (v === "no") onChange({ frankedRate: 0 });
+                  // "partial" leaves the existing partial value
+                }} style={miniInput}>
+                  <option value="yes">Yes (100% — AU domiciled)</option>
+                  <option value="no">No (0% — foreign)</option>
+                  <option value="partial">Partial (set % below)</option>
                 </select>
               </MiniField>
+              {(a.frankedRate ?? 0) !== 100 && (a.frankedRate ?? 0) !== 0 && (
+                <MiniField label="Franked %">
+                  <NumberInput step={5} value={a.frankedRate ?? 0} onChange={(v) => onChange({ frankedRate: v })} style={miniInput} />
+                </MiniField>
+              )}
             </>
+          )}
+          {/* Ownership editor — only for assets that have tax/cashflow implications */}
+          {!isOffset && a.category !== "super" && a.category !== "cash" && earners.length > 0 && (
+            <div style={{ gridColumn: "1 / -1", marginTop: 4, paddingTop: 10, borderTop: `1px dashed ${C.line}` }}>
+              <div style={{ fontSize: 10, color: C.textDim, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 8 }}>
+                Ownership (for tax)
+              </div>
+              <OwnershipEditor
+                earners={earners}
+                shares={a.ownershipShares || (a.earnerId ? { [a.earnerId]: 100 } : {})}
+                onChange={(shares) => onChange({ ownershipShares: shares, earnerId: null })}
+              />
+            </div>
           )}
           {a.category === "super" && (
             <MiniField label="Owned by">
@@ -2996,6 +3123,64 @@ function MiniField({ label, children }) {
   );
 }
 
+// Ownership editor — small grid showing each earner with a percentage input.
+// User-entered shares should sum to 100; we show a warning if they don't, but persist as entered.
+function OwnershipEditor({ earners, shares, onChange }) {
+  const sum = Object.values(shares || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+  const updateShare = (earnerId, value) => {
+    const next = { ...shares };
+    const pct = Math.max(0, Math.min(100, Number(value) || 0));
+    if (pct === 0) delete next[earnerId];
+    else next[earnerId] = pct;
+    onChange(next);
+  };
+  // Quick action: split evenly across all earners
+  const splitEvenly = () => {
+    const eligible = earners;
+    if (eligible.length === 0) return;
+    const each = Math.floor(100 / eligible.length);
+    const remainder = 100 - each * eligible.length;
+    const next = {};
+    eligible.forEach((e, i) => { next[e.id] = each + (i === 0 ? remainder : 0); });
+    onChange(next);
+  };
+  const giveAllTo = (earnerId) => {
+    onChange({ [earnerId]: 100 });
+  };
+  return (
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, marginBottom: 6 }}>
+        {earners.map(en => (
+          <React.Fragment key={en.id}>
+            <div style={{ fontSize: 11, color: C.text, alignSelf: "center" }}>{en.name}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <NumberInput step={5} value={shares?.[en.id] ?? 0} onChange={(v) => updateShare(en.id, v)} style={{ ...miniInput, width: 70, textAlign: "right" }} />
+              <span style={{ fontSize: 10, color: C.textMute }}>%</span>
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 10, marginTop: 4 }}>
+        <div style={{ color: sum === 100 ? C.textMute : C.danger }}>
+          Total: {sum}% {sum !== 100 && "(must be 100)"}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {earners.length > 1 && (
+            <button type="button" onClick={splitEvenly} className="fp-btn" style={{ ...btnGhostXs }}>
+              Split evenly
+            </button>
+          )}
+          {earners.length === 1 && (
+            <button type="button" onClick={() => giveAllTo(earners[0].id)} className="fp-btn" style={{ ...btnGhostXs }}>
+              100% to {earners[0].name}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const btnGhost = {
   background: "transparent", border: `1px solid ${C.line}`, color: C.textDim,
   padding: "6px 12px", fontSize: 11, cursor: "pointer",
@@ -3227,7 +3412,7 @@ function SuperCard({ earnerList }) {
       {audEarners.map((e, i) => (
         <div key={i} className="mono" style={{ fontSize: 11, marginTop: 8, padding: 8, background: C.bg, border: `1px solid ${C.line}` }}>
           <div style={{ color: C.text }}>{e.name}</div>
-          <div style={{ color: C.textMute }}>SG {fmt(e.sgContrib)} + sal-sac {fmt(e.extraConcessional)} + match-c {fmt(e.matchConcessional || 0)} = conc {fmt(e.totalConcessional)}</div>
+          <div style={{ color: C.textMute }}>Super Guarantee {fmt(e.sgContrib)} + sal-sac {fmt(e.extraConcessional)} + match-c {fmt(e.matchConcessional || 0)} = conc {fmt(e.totalConcessional)}</div>
           {e.concessionalExcess > 0 && <div style={{ color: C.danger }}>excess conc {fmt(e.concessionalExcess)} (taxed at MTR)</div>}
           <div style={{ color: C.textMute }}>contribs tax {fmt(e.concessionalTax)}{e.div293Tax > 0 && ` + Div 293 ${fmt(e.div293Tax)}`}</div>
           {e.totalNonConcessional > 0 && (
@@ -3395,7 +3580,7 @@ function TraceTab({ state, currentRow, selectedYear, setSelectedYear, projection
                 {(e.totalConcessional > 0 || e.totalNonConcessional > 0) && (
                   <>
                     <TraceLine indent={1} label="super contributions" value="" header />
-                    {e.sgContrib > 0 && <TraceLine indent={2} label="employer SG" value={fmt(e.sgContrib)} />}
+                    {e.sgContrib > 0 && <TraceLine indent={2} label="employer Super Guarantee" value={fmt(e.sgContrib)} />}
                     {e.extraConcessional > 0 && <TraceLine indent={2} label="salary sacrifice (concessional)" value={fmt(e.extraConcessional)} />}
                     {e.matchConcessional > 0 && <TraceLine indent={2} label="company match (concessional)" value={fmt(e.matchConcessional)} />}
                     <TraceLine indent={2} label="total concessional" value={fmt(e.totalConcessional)} subtotal />
