@@ -966,6 +966,126 @@ function useClickOutside(active, onOutside) {
   return ref;
 }
 
+// ===== Drag-to-reorder hook =====
+// Returns { dragProps, isDragging, isDragOver } for each row index.
+// Caller passes the array and a setter; the hook handles drag state and reorder logic.
+// Native HTML5 drag-and-drop — no library; desktop-friendly.
+function useDragReorder(items, onReorder) {
+  const [draggingIdx, setDraggingIdx] = useState(null);
+  const [overIdx, setOverIdx] = useState(null);
+
+  const handlersFor = (idx) => ({
+    draggable: true,
+    onDragStart: (e) => {
+      setDraggingIdx(idx);
+      e.dataTransfer.effectAllowed = "move";
+      // Some browsers require setData to start a drag
+      try { e.dataTransfer.setData("text/plain", String(idx)); } catch {}
+    },
+    onDragOver: (e) => {
+      e.preventDefault(); // required to allow drop
+      e.dataTransfer.dropEffect = "move";
+      if (overIdx !== idx) setOverIdx(idx);
+    },
+    onDragLeave: () => {
+      // Don't clear overIdx here — onDragOver on the next row will replace it
+    },
+    onDrop: (e) => {
+      e.preventDefault();
+      if (draggingIdx == null || draggingIdx === idx) {
+        setDraggingIdx(null); setOverIdx(null); return;
+      }
+      const next = items.slice();
+      const [moved] = next.splice(draggingIdx, 1);
+      const insertAt = idx > draggingIdx ? idx - 1 : idx;
+      next.splice(insertAt, 0, moved);
+      onReorder(next);
+      setDraggingIdx(null); setOverIdx(null);
+    },
+    onDragEnd: () => {
+      setDraggingIdx(null); setOverIdx(null);
+    },
+    style: {
+      opacity: draggingIdx === idx ? 0.4 : 1,
+      borderTop: overIdx === idx && draggingIdx != null && draggingIdx > idx ? `2px solid ${C.accent}` : undefined,
+      borderBottom: overIdx === idx && draggingIdx != null && draggingIdx < idx ? `2px solid ${C.accent}` : undefined,
+    },
+  });
+
+  return { handlersFor, draggingIdx };
+}
+
+// Six-dot drag handle to grab a row by. Sits on the left edge.
+function DragHandle({ onMouseDown }) {
+  return (
+    <div
+      onMouseDown={onMouseDown}
+      title="Drag to reorder"
+      style={{
+        cursor: "grab",
+        color: C.textMute,
+        opacity: 0.5,
+        padding: "0 4px",
+        userSelect: "none",
+        display: "flex",
+        alignItems: "center",
+        fontSize: 12,
+        letterSpacing: "-2px",
+      }}
+    >
+      ⋮⋮
+    </div>
+  );
+}
+
+// Generic sortable list wrapper. Renders each item with a drag handle and supports
+// HTML5 drag-and-drop reordering. The render fn receives the item (no special props).
+// Only the drag handle starts drags — the rest of the row stays clickable for editing.
+function DragList({ items, getKey, render, onReorder }) {
+  const { handlersFor } = useDragReorder(items, onReorder);
+  return (
+    <>
+      {items.map((item, idx) => {
+        const handlers = handlersFor(idx);
+        // Split: handle gets dragstart/end, the row container gets dragover/drop for the visual indicator
+        const { draggable, onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop, style } = handlers;
+        return (
+          <div
+            key={getKey(item, idx)}
+            onDragOver={onDragOver}
+            onDragLeave={onDragLeave}
+            onDrop={onDrop}
+            style={{ ...style, display: "flex", alignItems: "stretch", gap: 0 }}
+          >
+            <div
+              draggable={draggable}
+              onDragStart={onDragStart}
+              onDragEnd={onDragEnd}
+              title="Drag to reorder"
+              style={{
+                cursor: "grab",
+                color: C.textMute,
+                opacity: 0.5,
+                padding: "0 6px",
+                userSelect: "none",
+                display: "flex",
+                alignItems: "center",
+                fontSize: 12,
+                letterSpacing: "-2px",
+              }}
+            >
+              ⋮⋮
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              {render(item, idx)}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 // ---------- App ----------
 export default function FinancialPlanner() {
   const [scenarios, setScenarios] = useState({ "Base case": DEFAULT_STATE });
@@ -1028,6 +1148,8 @@ export default function FinancialPlanner() {
   // ===== Load scenarios when ready (Supabase if authenticated, else localStorage) =====
   useEffect(() => {
     if (!authReady) return;
+    // Reset the supabaseIdByName ref whenever auth state changes — a different user means different IDs
+    supabaseIdByName.current = {};
     (async () => {
       let loadedData = null;
       let didMigrateLocal = false;
@@ -1048,9 +1170,9 @@ export default function FinancialPlanner() {
             if (Object.keys(migratedLocal).length > 0) {
               const result = await saveToSupabase(session.user.id, { scenarios: migratedLocal });
               if (result.ok) {
-                // Stamp _supabaseId onto each scenario
+                // Capture new IDs into the ref (not state)
                 Object.keys(migratedLocal).forEach(name => {
-                  if (result.idByName[name]) migratedLocal[name]._supabaseId = result.idByName[name];
+                  if (result.idByName[name]) supabaseIdByName.current[name] = result.idByName[name];
                 });
                 loadedData = { scenarios: migratedLocal, active: local.active };
                 didMigrateLocal = true;
@@ -1067,8 +1189,14 @@ export default function FinancialPlanner() {
       if (loadedData && loadedData.scenarios) {
         const migrated = {};
         Object.entries(loadedData.scenarios).forEach(([name, scen]) => {
+          // Capture supabase id into the ref (not state)
+          if (scen._supabaseId) supabaseIdByName.current[name] = scen._supabaseId;
           const m = migrateScenario(scen);
-          if (m) migrated[name] = { ...m, _supabaseId: scen._supabaseId };
+          if (m) {
+            // Strip _supabaseId from state so it never triggers re-saves
+            const { _supabaseId, ...clean } = m;
+            migrated[name] = clean;
+          }
         });
         if (Object.keys(migrated).length > 0) {
           setScenarios(migrated);
@@ -1088,6 +1216,9 @@ export default function FinancialPlanner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authReady, session?.user?.id]);
 
+  // Track Supabase row IDs by scenario name in a ref — does NOT trigger re-renders or re-saves
+  const supabaseIdByName = useRef({});
+
   // ===== Save scenarios on change =====
   // Debounced save: when scenarios change, wait 800ms then persist. Avoids spamming Supabase
   // on every keystroke. Also writes to localStorage as a fallback cache.
@@ -1097,20 +1228,21 @@ export default function FinancialPlanner() {
     if (!SUPABASE_ENABLED || !session?.user?.id) return;
     setSyncStatus("saving");
     const handle = setTimeout(async () => {
-      const result = await saveToSupabase(session.user.id, { scenarios, active: activeScenario });
+      // Build scenarios with _supabaseId stamped from the ref (so upsert uses UPDATE for known rows)
+      const scenariosWithIds = {};
+      for (const [name, scen] of Object.entries(scenarios)) {
+        scenariosWithIds[name] = supabaseIdByName.current[name]
+          ? { ...scen, _supabaseId: supabaseIdByName.current[name] }
+          : scen;
+      }
+      const result = await saveToSupabase(session.user.id, { scenarios: scenariosWithIds, active: activeScenario });
       if (result.ok) {
         setSyncStatus("idle");
-        // Stamp _supabaseId back onto state for new rows (so future saves use UPDATE not INSERT)
-        if (result.idByName && Object.keys(result.idByName).length > 0) {
-          setScenarios(prev => {
-            const next = { ...prev };
-            for (const [name, id] of Object.entries(result.idByName)) {
-              if (next[name] && !next[name]._supabaseId) {
-                next[name] = { ...next[name], _supabaseId: id };
-              }
-            }
-            return next;
-          });
+        // Update the ref with any new IDs from the response — does not trigger re-render
+        if (result.idByName) {
+          for (const [name, id] of Object.entries(result.idByName)) {
+            supabaseIdByName.current[name] = id;
+          }
         }
       } else {
         setSyncStatus("error");
@@ -1128,6 +1260,18 @@ export default function FinancialPlanner() {
       return { ...prev, [activeScenario]: next };
     });
   };
+
+  // Reorder helpers — used by drag-to-reorder
+  const reorderEarners = (next) => setState(s => ({ ...s, earners: next }));
+  const reorderAssets = (filter, next) => setState(s => {
+    // Replace the filtered subset within the full assets array, preserving non-matching items in place
+    const others = s.assets.filter(a => !filter(a));
+    return { ...s, assets: [...next, ...others] };
+  });
+  const reorderLiabilities = (next) => setState(s => ({ ...s, liabilities: next }));
+  const reorderKids = (next) => setState(s => ({ ...s, kids: next }));
+  const reorderExpenses = (next) => setState(s => ({ ...s, expenses: next }));
+  const reorderEvents = (next) => setState(s => ({ ...s, events: next }));
 
   const projection = useMemo(() => {
     try { return project(state); } catch (e) {
@@ -1220,15 +1364,16 @@ export default function FinancialPlanner() {
 
   const deleteScenario = (name) => {
     if (Object.keys(scenarios).length <= 1) return;
-    const supabaseId = scenarios[name]?._supabaseId;
+    const supabaseId = supabaseIdByName.current[name];
     setScenarios(prev => {
       const next = { ...prev };
       delete next[name];
       return next;
     });
     if (activeScenario === name) setActiveScenario(Object.keys(scenarios).filter(s => s !== name)[0]);
-    // Best-effort Supabase delete (debounced save would re-upsert remaining scenarios anyway)
+    // Best-effort Supabase delete + clean ref
     if (supabaseId) deleteFromSupabase(supabaseId);
+    delete supabaseIdByName.current[name];
   };
 
   const resetDefaults = () => {
@@ -1474,6 +1619,7 @@ export default function FinancialPlanner() {
           {SUPABASE_ENABLED && session && (
             <button onClick={async () => {
               await supabase.auth.signOut();
+              supabaseIdByName.current = {};
               setScenarios({ "Base case": DEFAULT_STATE });
               setActiveScenario("Base case");
               setLoaded(false);
@@ -1735,84 +1881,119 @@ export default function FinancialPlanner() {
               </button>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              {state.events.map(ev => (
-                <EventRow key={ev.id} ev={ev} maxYear={state.meta.horizonYears} currentAge={state.meta.currentAge} earners={state.earners}
-                  editing={editingEvent === ev.id}
-                  onEdit={() => setEditingEvent(editingEvent === ev.id ? null : ev.id)}
-                  onChange={(patch) => updateEvent(ev.id, patch)}
-                  onRemove={() => removeEvent(ev.id)}
-                />
-              ))}
+              <DragList
+                items={state.events}
+                getKey={(ev) => ev.id}
+                onReorder={reorderEvents}
+                render={(ev) => (
+                  <EventRow ev={ev} maxYear={state.meta.horizonYears} currentAge={state.meta.currentAge} earners={state.earners}
+                    editing={editingEvent === ev.id}
+                    onEdit={() => setEditingEvent(editingEvent === ev.id ? null : ev.id)}
+                    onChange={(patch) => updateEvent(ev.id, patch)}
+                    onRemove={() => removeEvent(ev.id)}
+                  />
+                )}
+              />
             </div>
           </div>
         </div>
 
         <div>
           <Section title="Income" subtitle="Salary · base + bonus · tax" onAdd={addEarner}>
-            {state.earners.map(e => (
-              <EarnerRow key={e.id} e={e} currentRow={currentRow}
-                editing={editingEarner === e.id}
-                onEdit={() => setEditingEarner(editingEarner === e.id ? null : e.id)}
-                onChange={(patch) => updateEarner(e.id, patch)}
-                onRemove={() => removeEarner(e.id)}
-                canRemove={state.earners.length > 1}
-              />
-            ))}
+            <DragList
+              items={state.earners}
+              getKey={(e) => e.id}
+              onReorder={reorderEarners}
+              render={(e) => (
+                <EarnerRow e={e} currentRow={currentRow}
+                  editing={editingEarner === e.id}
+                  onEdit={() => setEditingEarner(editingEarner === e.id ? null : e.id)}
+                  onChange={(patch) => updateEarner(e.id, patch)}
+                  onRemove={() => removeEarner(e.id)}
+                  canRemove={state.earners.length > 1}
+                />
+              )}
+            />
           </Section>
 
           <Section title="Superannuation" subtitle="Concessional & non-concessional · ATO caps · 15% contribs tax" onAdd={addSuper} bordered>
-            {state.assets.filter(a => a.category === "super").map(a => (
-              <AssetRow key={a.id} a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
-                editing={editingAsset === a.id}
-                onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
-                onChange={(patch) => updateAsset(a.id, patch)}
-                onRemove={() => removeAsset(a.id)}
-              />
-            ))}
+            <DragList
+              items={state.assets.filter(a => a.category === "super")}
+              getKey={(a) => a.id}
+              onReorder={(next) => reorderAssets((a) => a.category === "super", next)}
+              render={(a) => (
+                <AssetRow a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                  editing={editingAsset === a.id}
+                  onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
+                  onChange={(patch) => updateAsset(a.id, patch)}
+                  onRemove={() => removeAsset(a.id)}
+                />
+              )}
+            />
           </Section>
 
           <Section title="Assets" subtitle="Property · equities · cash · other" onAdd={addAsset} bordered>
-            {state.assets.filter(a => a.category !== "super").map(a => (
-              <AssetRow key={a.id} a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
-                editing={editingAsset === a.id}
-                onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
-                onChange={(patch) => updateAsset(a.id, patch)}
-                onRemove={() => removeAsset(a.id)}
-              />
-            ))}
+            <DragList
+              items={state.assets.filter(a => a.category !== "super")}
+              getKey={(a) => a.id}
+              onReorder={(next) => reorderAssets((a) => a.category !== "super", next)}
+              render={(a) => (
+                <AssetRow a={a} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                  editing={editingAsset === a.id}
+                  onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
+                  onChange={(patch) => updateAsset(a.id, patch)}
+                  onRemove={() => removeAsset(a.id)}
+                />
+              )}
+            />
           </Section>
 
           <Section title="School fees" subtitle="Per child · fees grow annually" onAdd={addKid} bordered>
-            {state.kids.map(k => (
-              <KidRow key={k.id} k={k}
-                editing={editingKid === k.id}
-                onEdit={() => setEditingKid(editingKid === k.id ? null : k.id)}
-                onChange={(patch) => updateKid(k.id, patch)}
-                onRemove={() => removeKid(k.id)}
-              />
-            ))}
+            <DragList
+              items={state.kids}
+              getKey={(k) => k.id}
+              onReorder={reorderKids}
+              render={(k) => (
+                <KidRow k={k}
+                  editing={editingKid === k.id}
+                  onEdit={() => setEditingKid(editingKid === k.id ? null : k.id)}
+                  onChange={(patch) => updateKid(k.id, patch)}
+                  onRemove={() => removeKid(k.id)}
+                />
+              )}
+            />
           </Section>
 
           <Section title="Living expenses" subtitle="Per-item · each with own growth and time window" onAdd={addExpense} bordered>
-            {(state.expenses || []).map(x => (
-              <ExpenseRow key={x.id} x={x} maxYear={state.meta.horizonYears} currentAge={state.meta.currentAge}
-                editing={editingExpense === x.id}
-                onEdit={() => setEditingExpense(editingExpense === x.id ? null : x.id)}
-                onChange={(patch) => updateExpense(x.id, patch)}
-                onRemove={() => removeExpense(x.id)}
-              />
-            ))}
+            <DragList
+              items={state.expenses || []}
+              getKey={(x) => x.id}
+              onReorder={reorderExpenses}
+              render={(x) => (
+                <ExpenseRow x={x} maxYear={state.meta.horizonYears} currentAge={state.meta.currentAge}
+                  editing={editingExpense === x.id}
+                  onEdit={() => setEditingExpense(editingExpense === x.id ? null : x.id)}
+                  onChange={(patch) => updateExpense(x.id, patch)}
+                  onRemove={() => removeExpense(x.id)}
+                />
+              )}
+            />
           </Section>
 
           <Section title="Other debts" subtitle="Non-property loans · credit, margin, etc." onAdd={addLiab} bordered>
-            {state.liabilities.map(l => (
-              <LiabRow key={l.id} l={l} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
-                editing={editingLiab === l.id}
-                onEdit={() => setEditingLiab(editingLiab === l.id ? null : l.id)}
-                onChange={(patch) => updateLiab(l.id, patch)}
-                onRemove={() => removeLiab(l.id)}
-              />
-            ))}
+            <DragList
+              items={state.liabilities}
+              getKey={(l) => l.id}
+              onReorder={reorderLiabilities}
+              render={(l) => (
+                <LiabRow l={l} earners={state.earners} cashAssets={state.assets.filter(x => x.category === "cash")}
+                  editing={editingLiab === l.id}
+                  onEdit={() => setEditingLiab(editingLiab === l.id ? null : l.id)}
+                  onChange={(patch) => updateLiab(l.id, patch)}
+                  onRemove={() => removeLiab(l.id)}
+                />
+              )}
+            />
           </Section>
         </div>
       </div>
@@ -2233,9 +2414,9 @@ function EarnerRow({ e, currentRow, editing, onEdit, onChange, onRemove, canRemo
           <MiniField label={`Base salary (${ccy})`}>
             <NumberInput value={e.salary} onChange={(v) => onChange({ salary: v })} style={miniInput} />
           </MiniField>
+          <MiniField label="Salary growth %"><NumberInput step={0.1} value={e.salaryGrowth} onChange={(v) => onChange({ salaryGrowth: v })} style={miniInput} /></MiniField>
           <MiniField label="Cash bonus % of base"><NumberInput step={0.5} value={e.bonusRateCash || 0} onChange={(v) => onChange({ bonusRateCash: v })} style={miniInput} /></MiniField>
           <MiniField label="Share bonus % of base"><NumberInput step={0.5} value={e.bonusRateShares || 0} onChange={(v) => onChange({ bonusRateShares: v })} style={miniInput} /></MiniField>
-          <MiniField label="Salary growth %"><NumberInput step={0.1} value={e.salaryGrowth} onChange={(v) => onChange({ salaryGrowth: v })} style={miniInput} /></MiniField>
           <MiniField label="Tax method">
             <select value={e.taxMode || (isSG ? "sg" : "ato")} onChange={ev => onChange({ taxMode: ev.target.value })} style={miniInput}>
               {!isSG && <option value="ato">ATO 2025–26 progressive + Medicare</option>}
