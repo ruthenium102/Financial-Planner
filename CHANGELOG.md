@@ -4,6 +4,39 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.6 — 2 May 2026
+
+**Liability chart shows each loan stacked**
+- The Liabilities view now stacks each loan as its own band so you can see how individual debts pay down over time.
+- All loans share the danger-red hue, with each loan getting a slightly different gradient opacity to remain visually distinguishable.
+- Hover tooltips show the per-loan balance.
+
+**Property categories: Primary Residence vs Investment Property**
+- The single "Property" category is split into two distinct categories: **Primary Residence** and **Investment Property**.
+- Per-loan "Investment loan?" toggle on properties is removed — the property category drives it.
+- Engine: only Investment Property generates rental income, deductible interest, and negative gearing. Primary Residence has none.
+- Migration: any legacy property with at least one investment-flagged loan becomes Investment Property; otherwise Primary Residence. No manual rework.
+
+**"Owned by (for tax)" dropdown removed from properties**
+- Redundant with the ownership editor (introduced in v1.4) which handles per-earner percentage splits.
+- Standalone investment liabilities (e.g. margin loans) keep their owned-by dropdown since they don't have ownership shares.
+
+**Share Plan consolidated into Shares**
+- The "sharePlan" category is merged into "equities". Both are now a single category labelled **Shares**.
+- New field on each earner: **Shares vest into** — pick which Shares asset receives the share bonus vesting.
+- Warning shown if share bonus is set but no Shares asset exists to track vesting.
+- Migration: existing sharePlan assets are converted to equities.
+
+**Reset confirmation message clarified**
+- Reset now only resets the **current** scenario back to default. Other scenarios are unaffected.
+- Message reads: *"Reset the current scenario [tab name] to default. Other scenarios are unaffected."*
+
+**Concessional / non-concessional caps removed from Assumptions**
+- Caps are sourced from ATO 2025–26 directly as constants (concessional $30k, non-concessional $120k).
+- No longer user-editable. When ATO updates the caps in future years, the constants will be updated in code.
+
+---
+
 ## v1.5 — 2 May 2026
 
 **Offset moved onto the loan**

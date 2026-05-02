@@ -33,18 +33,20 @@ const C = {
 };
 
 const CATEGORY_META = {
-  property: { label: "Property", color: C.property, icon: Home },
-  equities: { label: "Equities", color: C.equities, icon: TrendingUp },
+  primaryResidence: { label: "Primary Residence", color: C.property, icon: Home },
+  investmentProperty: { label: "Investment Property", color: C.property, icon: Home },
+  equities: { label: "Shares", color: C.equities, icon: TrendingUp },
   cash: { label: "Cash", color: C.cash, icon: DollarSign },
   offset: { label: "Mortgage Offset", color: C.cash, icon: DollarSign },
   super: { label: "Superannuation", color: C.super_, icon: PiggyBank },
-  sharePlan: { label: "Share Plan", color: C.sharePlan, icon: TrendingUp },
   other: { label: "Other", color: C.other, icon: Layers },
+  // Legacy "property" and "sharePlan" categories — kept as fallback meta only, won't appear in selectors.
+  property: { label: "Property", color: C.property, icon: Home },
+  sharePlan: { label: "Shares", color: C.equities, icon: TrendingUp },
 };
 
-// Stack order (bottom to top in chart). Cash + offset on top makes drawdown visible.
-// Offsets share the cash color so they read as a single "available cash" stack visually.
-const CATEGORY_ORDER = ["property", "super", "equities", "sharePlan", "other", "cash", "offset"];
+// Stack order (bottom to top in chart).
+const CATEGORY_ORDER = ["primaryResidence", "investmentProperty", "super", "equities", "other", "cash", "offset"];
 
 // ---------- Defaults ----------
 const DEFAULT_STATE = {
@@ -68,7 +70,8 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.5";
+const VERSION = "v1.6";
+
 
 // =================================================================
 // Storage layer — Supabase when authenticated, localStorage as fallback
@@ -151,20 +154,25 @@ function migrateScenario(s) {
   const out = {
     meta: { fxSgdAud: 1.15, retirementSpendingMultiplier: 0.75, ...(s.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" }) },
     assets: Array.isArray(s.assets) ? s.assets.map(a => {
-      const aOut = { runningExpenses: 0, earnerId: null, frankedRate: a.category === "equities" ? 100 : 0, ...a };
-      // Convert flat income → dividendYield for equities and sharePlan (% of value)
-      if ((aOut.category === "equities" || aOut.category === "sharePlan") && aOut.dividendYield == null) {
+      const aOut = { runningExpenses: 0, earnerId: null, frankedRate: (a.category === "equities") ? 100 : 0, ...a };
+      // ===== Category migration =====
+      // Legacy "sharePlan" → "equities" (consolidated as "Shares")
+      if (aOut.category === "sharePlan") aOut.category = "equities";
+      // Legacy "property" → "investmentProperty" if any loan was flagged investment, else "primaryResidence"
+      if (aOut.category === "property") {
+        const anyInvestment = (a.loans || []).some(l => l.isInvestment) || a.loan?.isInvestment;
+        aOut.category = anyInvestment ? "investmentProperty" : "primaryResidence";
+      }
+      // Convert flat income → dividendYield for equities (yield-based)
+      if (aOut.category === "equities" && aOut.dividendYield == null) {
         if (aOut.income > 0 && aOut.value > 0) {
           aOut.dividendYield = (aOut.income / aOut.value) * 100;
         } else {
-          aOut.dividendYield = aOut.category === "equities" ? 4 : 0;
+          aOut.dividendYield = 4;
         }
-        // Clear flat income — yield-based now
         aOut.income = 0;
       }
-      // Joint ownership migration: convert legacy earnerId → ownershipShares
-      // If ownershipShares already set, leave it. Otherwise, default to 100% to current earnerId
-      // (or empty object if no earnerId — engine falls back to first AUD earner)
+      // Joint ownership migration
       if (!aOut.ownershipShares) {
         if (aOut.earnerId) {
           aOut.ownershipShares = { [aOut.earnerId]: 100 };
@@ -175,8 +183,14 @@ function migrateScenario(s) {
       // Normalise loan(s): support legacy a.loan (single object) → a.loans (array)
       let loans = Array.isArray(a.loans) ? a.loans.slice() : [];
       if (a.loan) loans.push(a.loan);
+      // For investment property: force isInvestment = true on all loans (category drives it)
+      // For primary residence: force isInvestment = false
+      const isIP = aOut.category === "investmentProperty";
+      const isPR = aOut.category === "primaryResidence";
       loans = loans.map(loan => {
         const ln = { isInvestment: false, offsetCashAssetId: null, earnerId: null, ...loan };
+        if (isIP) ln.isInvestment = true;
+        else if (isPR) ln.isInvestment = false;
         if (!ln.type) {
           if (ln.annualPayment != null) {
             const io = (ln.balance || 0) * ((ln.rate || 0) / 100);
@@ -475,6 +489,21 @@ function computeAnnualPayment(loan) {
 }
 
 // ---------- Projection engine ----------
+// Property categories: "primaryResidence" and "investmentProperty" both behave as property,
+// but only investmentProperty generates rental income / negative gearing.
+function isPropertyCategory(cat) {
+  return cat === "primaryResidence" || cat === "investmentProperty" || cat === "property";
+}
+function isInvestmentProperty(asset) {
+  if (!asset) return false;
+  if (asset.category === "investmentProperty") return true;
+  // Legacy: a "property" with at least one investment loan
+  if (asset.category === "property") {
+    return (asset.loans || []).some(l => l.isInvestment);
+  }
+  return false;
+}
+
 function project(state) {
   // Defensive: normalise missing arrays so old/corrupt scenarios don't crash
   const meta = state.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" };
@@ -605,24 +634,23 @@ function project(state) {
       if (fallback) accumulator[fallback] = (accumulator[fallback] || 0) + amount;
     };
 
-    // Second pass: per-asset rental result for properties with investment loans
-    // Rental income comes from a.income; running expenses from a.runningExpenses.
-    // Sum of investment-loan interest attributed to this property reduces the rental result.
+    // Second pass: per-asset rental result for INVESTMENT properties.
+    // Primary residence: no rental income, running expenses are personal (not deductible),
+    // mortgage interest is not deductible.
     assets.forEach(a => {
-      if (a.category !== "property") return;
+      if (!isInvestmentProperty(a)) return;
       const scale = balances[a.id] / (a.value || 1);
       const grossRental = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
       const runningExp = (a.runningExpenses || 0);
-      // Interest on investment loans attached to this property
+      // Interest on all loans attached to this investment property is deductible
       let propertyInvestmentInterest = 0;
       Object.keys(loanMeta).forEach(key => {
         const m = loanMeta[key];
-        if (m.assetId === a.id && m.isInvestment) {
+        if (m.assetId === a.id) {
           propertyInvestmentInterest += interestThisYear[key] || 0;
         }
       });
       const netRental = grossRental - runningExp - propertyInvestmentInterest;
-      // Distribute across owners by their ownership shares
       distributeByOwnership(a, netRental, rentalAdjustmentByEarner);
       totalRentalIncome += grossRental;
       totalRentalExpenses += runningExp;
@@ -656,22 +684,22 @@ function project(state) {
     const frankingCreditByEarner = {};        // earnerId → franking credits to offset tax
     assets.forEach(a => {
       if (a.category === "offset") return; // offsets earn no income
+      if (a.category === "primaryResidence") return; // PR has no rental, no income
       // Compute gross income for this asset
       let grossIncome;
-      if (a.category === "equities" || a.category === "sharePlan") {
-        // Yield-based: % of current balance
+      if (a.category === "equities") {
         grossIncome = (balances[a.id] || 0) * ((a.dividendYield || 0) / 100);
       } else {
-        // Flat income, scaled if balance has changed since input value
         const scale = balances[a.id] / (a.value || 1);
         grossIncome = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
       }
-      if (a.category === "property") {
+      if (a.category === "investmentProperty" || a.category === "property") {
+        // Investment properties: rent and running expenses go to propertyCashFlow.
+        // (Tax effect is handled separately above via rentalAdjustmentByEarner.)
         const runningExp = (a.runningExpenses || 0);
         propertyCashFlow += grossIncome - runningExp;
       } else if (grossIncome > 0) {
         assetIncome += grossIncome;
-        // Distribute across owners by ownership shares
         const frankedPct = (a.frankedRate || 0) / 100;
         const grossedUp = grossIncome + grossIncome * frankedPct * (30 / 70);
         const frankingCredit = grossIncome * frankedPct * (30 / 70);
@@ -1021,24 +1049,25 @@ function project(state) {
       }
     });
 
-    // ===== Route share bonus to share plan asset(s) =====
+    // ===== Route share bonus to chosen Shares asset =====
+    // Each earner can pick `sharePlanAssetId` — one asset their share bonus vests into.
+    // Fallback chain: chosen asset → first equity asset → silently lost (user warning shown elsewhere)
     earners.forEach(e => {
       const shareIn = shareBonusByEarner[e.id];
       if (!shareIn) return;
-      const earnerShares = assets.filter(a => a.category === "sharePlan" && a.earnerId === e.id);
-      if (earnerShares.length > 0) {
-        const per = shareIn / earnerShares.length;
-        earnerShares.forEach(a => { balances[a.id] += per; });
-      } else {
-        // Fallback: any unassigned share plan asset
-        const anyShares = assets.filter(a => a.category === "sharePlan");
-        if (anyShares.length > 0) {
-          const per = shareIn / anyShares.length;
-          anyShares.forEach(a => { balances[a.id] += per; });
-        }
-        // If no share plan asset exists, the share bonus is effectively lost in the model.
-        // User should add a Share Plan asset for the earner to track it.
+      const target = e.sharePlanAssetId
+        ? assets.find(a => a.id === e.sharePlanAssetId && a.category === "equities")
+        : null;
+      if (target) {
+        balances[target.id] += shareIn;
+        return;
       }
+      // Fallback: first equity asset (if any)
+      const anyEquity = assets.find(a => a.category === "equities");
+      if (anyEquity) {
+        balances[anyEquity.id] += shareIn;
+      }
+      // Otherwise lost — earner row shows a warning
     });
 
     const cashAssets = assets.filter(a => a.category === "cash");
@@ -1077,7 +1106,7 @@ function project(state) {
           }
           // Remaining excess (or pure equities mode) flows to the designated equity asset
           if (excess > 0 && opt.sweepTargetEquityAssetId) {
-            const equityAsset = assets.find(a => a.id === opt.sweepTargetEquityAssetId && (a.category === "equities" || a.category === "sharePlan"));
+            const equityAsset = assets.find(a => a.id === opt.sweepTargetEquityAssetId && (a.category === "equities"));
             if (equityAsset) {
               balances[equityAsset.id] = (balances[equityAsset.id] || 0) + excess;
               balances[sourceAsset.id] -= excess;
@@ -1088,7 +1117,7 @@ function project(state) {
     }
     // ===== END cash sweep =====
 
-    const byCat = { property: 0, equities: 0, cash: 0, offset: 0, super: 0, sharePlan: 0, other: 0 };
+    const byCat = { primaryResidence: 0, investmentProperty: 0, equities: 0, cash: 0, offset: 0, super: 0, other: 0 };
     assets.forEach(a => { byCat[a.category] = (byCat[a.category] || 0) + balances[a.id]; });
     // Sum loan-attached offset balances into the cash stack for the wealth chart.
     // (Offsets are conceptually cash that's reducing loan interest — still household money.)
@@ -1100,10 +1129,28 @@ function project(state) {
     const allRetired = earners.every(e => earnerState[e.id].retired);
     const anyRetired = earners.some(e => earnerState[e.id].retired);
 
+    // Per-loan balances flattened as top-level row fields (loan_KEY) for stacked chart use.
+    // Also include a structured loanBreakdown for the Trace tab.
+    const loanFlat = {};
+    const loanBreakdown = {};
+    Object.keys(liabs).forEach(key => {
+      loanFlat[`loan_${key}`] = liabs[key];
+      loanBreakdown[key] = {
+        balance: liabs[key],
+        offset: offsetByLoan[key] || 0,
+        rate: loanMeta[key]?.rate || 0,
+        type: loanMeta[key]?.type,
+        assetId: loanMeta[key]?.assetId,
+      };
+    });
+
     rows.push({
       year: y, age, ...byCat, totalAssets, liabilities: totalLiab, netWealth, netCashflow,
       totalGross, totalNet, totalTax, expenses, expenseBreakdown,
       schoolFees, earnerBreakdown, feesByKid, allRetired, anyRetired, activeEvents,
+      // Per-loan balance fields for stacked liability chart
+      ...loanFlat,
+      loanBreakdown,
       // Engine internals exposed for the calculation Trace tab:
       totalLiabPayment, assetIncome, eventLump, eventExpense,
     });
@@ -1477,7 +1524,7 @@ export default function FinancialPlanner() {
       console.error("Projection error:", e);
       return [{
         year: 0, age: state.meta?.currentAge || 45,
-        property: 0, equities: 0, cash: 0, offset: 0, super: 0, sharePlan: 0, other: 0,
+        primaryResidence: 0, investmentProperty: 0, equities: 0, cash: 0, offset: 0, super: 0, other: 0,
         totalAssets: 0, liabilities: 0, netWealth: 0, netCashflow: 0,
         totalGross: 0, totalNet: 0, totalTax: 0, expenses: 0, expenseBreakdown: {},
         schoolFees: 0, earnerBreakdown: {}, feesByKid: {},
@@ -1499,6 +1546,8 @@ export default function FinancialPlanner() {
       // Per-expense / per-event metadata (rates, years, durations — not dollar amounts)
       "growthPct", "startYear", "endYear",
       "type", "yearOffset", "duration", "category", "earnerId",
+      // Loan metadata (rate is a percentage, not a dollar amount)
+      "rate", "assetId",
     ]);
     const deflateValue = (val, factor) => {
       if (val == null) return val;
@@ -1524,6 +1573,36 @@ export default function FinancialPlanner() {
   }, [projection, displayMode, state.meta?.inflation]);
 
   const currentRow = (selectedYear != null ? displayedProjection.find(r => r.year === selectedYear) : displayedProjection[displayedProjection.length - 1]) || displayedProjection[0];
+
+  // Build loan list for the stacked liability chart.
+  // Each entry: { key (used as dataKey suffix), name, color }.
+  // Colors are hue-shifted variants of the danger red so all loans read as debt.
+  const loanList = useMemo(() => {
+    const list = [];
+    state.assets.forEach(a => {
+      (a.loans || []).forEach(l => {
+        if ((l.balance || 0) > 0) {
+          list.push({
+            key: `asset:${a.id}:${l.id || "ln"}`,
+            name: a.name + (a.loans.length > 1 ? ` (loan ${a.loans.indexOf(l) + 1})` : ""),
+          });
+        }
+      });
+    });
+    state.liabilities.forEach(l => {
+      if ((l.balance || 0) > 0) {
+        list.push({ key: `liab:${l.id}`, name: l.name });
+      }
+    });
+    // Assign each loan a slight gradient variation by stop opacity tuple
+    return list.map((loan, idx) => {
+      // Spread opacities across the list — first loan: deepest; last loan: lightest
+      const t = list.length === 1 ? 0 : idx / (list.length - 1);
+      const top = 0.85 - t * 0.35;     // 0.85 → 0.50
+      const bot = 0.30 - t * 0.20;     // 0.30 → 0.10
+      return { ...loan, gradTop: top, gradBot: bot };
+    });
+  }, [state.assets, state.liabilities]);
 
   const renameScenario = (oldName, newName) => {
     const trimmed = newName.trim();
@@ -1577,10 +1656,9 @@ export default function FinancialPlanner() {
 
   const resetDefaults = () => {
     setConfirmModal({
-      msg: "Reset to default scenario? Your saved scenarios will be overwritten.",
+      msg: `Reset the current scenario "${activeScenario}" to default. Other scenarios are unaffected.`,
       onConfirm: () => {
-        setScenarios({ "Base case": DEFAULT_STATE });
-        setActiveScenario("Base case");
+        setScenarios(prev => ({ ...prev, [activeScenario]: DEFAULT_STATE }));
       },
     });
   };
@@ -1903,8 +1981,6 @@ export default function FinancialPlanner() {
             <NumberField label="Horizon (years)" value={state.meta.horizonYears} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, horizonYears: v } }))} />
             <NumberField label="Inflation %" value={state.meta.inflation} step={0.1} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, inflation: v } }))} />
             <NumberField label="FX rate (AUD per SGD)" value={state.meta.fxSgdAud ?? 1.15} step={0.01} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, fxSgdAud: v } }))} />
-            <NumberField label="Concessional cap" value={state.meta.concessionalCap ?? CONCESSIONAL_CAP} step={500} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, concessionalCap: v } }))} />
-            <NumberField label="Non-concessional cap" value={state.meta.nonConcessionalCap ?? NONCONCESSIONAL_CAP} step={1000} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, nonConcessionalCap: v } }))} />
             <NumberField label="Retirement spending %" value={(state.meta.retirementSpendingMultiplier ?? 0.75) * 100} step={5} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, retirementSpendingMultiplier: Math.max(0, v / 100) } }))} />
           </div>
 
@@ -2010,6 +2086,13 @@ export default function FinancialPlanner() {
                       <stop offset="0%" stopColor={C.danger} stopOpacity={0.6} />
                       <stop offset="100%" stopColor={C.danger} stopOpacity={0.05} />
                     </linearGradient>
+                    {/* Per-loan gradients — same red hue, varying opacity per loan for visual distinction */}
+                    {loanList.map(loan => (
+                      <linearGradient key={loan.key} id={`grad-loan-${loan.key}`} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={C.danger} stopOpacity={loan.gradTop} />
+                        <stop offset="100%" stopColor={C.danger} stopOpacity={loan.gradBot} />
+                      </linearGradient>
+                    ))}
                   </defs>
                   <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                   <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
@@ -2021,9 +2104,21 @@ export default function FinancialPlanner() {
                   {view === "net" && (
                     <Area type="monotone" dataKey="netWealth" stroke={C.accent} strokeWidth={2} fill="url(#grad-net)" />
                   )}
-                  {view === "liabilities" && (
+                  {view === "liabilities" && loanList.length === 0 && (
                     <Area type="monotone" dataKey="liabilities" stroke={C.danger} strokeWidth={2} fill="url(#grad-liabilities)" />
                   )}
+                  {view === "liabilities" && loanList.length > 0 && loanList.map(loan => (
+                    <Area
+                      key={loan.key}
+                      type="monotone"
+                      dataKey={`loan_${loan.key}`}
+                      stackId="liabilities"
+                      stroke={C.danger}
+                      strokeWidth={1}
+                      fill={`url(#grad-loan-${loan.key})`}
+                      name={loan.name}
+                    />
+                  ))}
                   {CATEGORY_ORDER.includes(view) && (
                     <Area type="monotone" dataKey={view} stroke={CATEGORY_META[view].color} strokeWidth={2} fill={`url(#grad-${view})`} />
                   )}
@@ -2122,6 +2217,7 @@ export default function FinancialPlanner() {
               onReorder={reorderEarners}
               render={(e) => (
                 <EarnerRow e={e} currentRow={currentRow}
+                  equityAssets={state.assets.filter(a => a.category === "equities")}
                   editing={editingEarner === e.id}
                   onEdit={() => setEditingEarner(editingEarner === e.id ? null : e.id)}
                   onChange={(patch) => updateEarner(e.id, patch)}
@@ -2563,7 +2659,7 @@ function EventRow({ ev, maxYear, currentAge, earners, editing, onEdit, onChange,
   );
 }
 
-function EarnerRow({ e, currentRow, editing, onEdit, onChange, onRemove, canRemove }) {
+function EarnerRow({ e, currentRow, equityAssets = [], editing, onEdit, onChange, onRemove, canRemove }) {
   const br = currentRow.earnerBreakdown?.[e.id];
   const ccy = e.currency || "AUD";
   const isSG = ccy === "SGD";
@@ -2653,6 +2749,19 @@ function EarnerRow({ e, currentRow, editing, onEdit, onChange, onRemove, canRemo
           <MiniField label="Salary growth %"><NumberInput step={0.1} value={e.salaryGrowth} onChange={(v) => onChange({ salaryGrowth: v })} style={miniInput} /></MiniField>
           <MiniField label="Cash bonus % of base"><NumberInput step={0.5} value={e.bonusRateCash || 0} onChange={(v) => onChange({ bonusRateCash: v })} style={miniInput} /></MiniField>
           <MiniField label="Share bonus % of base"><NumberInput step={0.5} value={e.bonusRateShares || 0} onChange={(v) => onChange({ bonusRateShares: v })} style={miniInput} /></MiniField>
+          {(e.bonusRateShares || 0) > 0 && (
+            <MiniField label="Shares vest into">
+              <select value={e.sharePlanAssetId || ""} onChange={ev => onChange({ sharePlanAssetId: ev.target.value || null })} style={miniInput}>
+                <option value="">— first Shares asset —</option>
+                {equityAssets.map(asset => <option key={asset.id} value={asset.id}>{asset.name}</option>)}
+              </select>
+            </MiniField>
+          )}
+          {(e.bonusRateShares || 0) > 0 && equityAssets.length === 0 && (
+            <div style={{ gridColumn: "1 / -1", fontSize: 10, color: C.danger, padding: "6px 10px", background: "#2a1818", border: `1px solid ${C.danger}`, marginTop: 4 }}>
+              ⚠ Share bonus is set but there's no Shares asset to vest into. Add a Shares asset under Assets to track these.
+            </div>
+          )}
           <MiniField label="Tax method">
             <select value={e.taxMode || (isSG ? "sg" : "ato")} onChange={ev => onChange({ taxMode: ev.target.value })} style={miniInput}>
               {!isSG && <option value="ato">ATO 2025–26 progressive + Medicare</option>}
@@ -2834,7 +2943,8 @@ function ExpenseRow({ x, maxYear, currentAge, editing, onEdit, onChange, onRemov
 function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, onRemove }) {
   const meta = CATEGORY_META[a.category];
   const earnerName = a.earnerId ? earners.find(e => e.id === a.earnerId)?.name : null;
-  const isProperty = a.category === "property";
+  const isProperty = a.category === "primaryResidence" || a.category === "investmentProperty" || a.category === "property";
+  const isInvestmentProperty = a.category === "investmentProperty";
   const isOffset = a.category === "offset";
   // Normalise loans: support legacy a.loan by folding it into a.loans
   const loans = Array.isArray(a.loans)
@@ -2852,6 +2962,8 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
       id: `ln${Date.now()}`,
       balance: 0, originalBalance: 0,
       rate: 6, type: "pi", termYears: 30,
+      // Investment loan flag follows the property category
+      isInvestment: isInvestmentProperty,
     };
     onChange({ loans: [...loans, newLoan], loan: undefined });
   };
@@ -2903,12 +3015,13 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
           <MiniField label="Value"><NumberInput value={a.value} onChange={(v) => onChange({ value: v })} style={miniInput} /></MiniField>
           {!isOffset && <MiniField label="Growth %"><NumberInput step={0.1} value={a.growth} onChange={(v) => onChange({ growth: v })} style={miniInput} /></MiniField>}
           {/* Income field varies by category */}
-          {!isOffset && (a.category === "equities" || a.category === "sharePlan") && (
+          {!isOffset && (a.category === "equities") && (
             <MiniField label="Dividend yield %">
               <NumberInput step={0.1} value={a.dividendYield ?? (a.category === "equities" ? 4 : 0)} onChange={(v) => onChange({ dividendYield: v })} style={miniInput} />
             </MiniField>
           )}
-          {!isOffset && a.category !== "equities" && a.category !== "sharePlan" && (
+          {/* Annual income: shown for investmentProperty (rent), cash (interest), other; hidden for PR, equities (uses yield), super, offset */}
+          {!isOffset && a.category !== "equities" && a.category !== "sharePlan" && a.category !== "primaryResidence" && a.category !== "super" && (
             <MiniField label="Annual income"><NumberInput value={a.income} onChange={(v) => onChange({ income: v })} style={miniInput} /></MiniField>
           )}
           {isOffset && (
@@ -2917,7 +3030,7 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
             </div>
           )}
           {/* Franking — for equities/sharePlan with yield, OR other assets with positive flat income */}
-          {!isOffset && ((a.category === "equities" || a.category === "sharePlan") ? (a.dividendYield ?? 0) > 0 : (a.income > 0 && a.category !== "property" && a.category !== "super")) && (
+          {!isOffset && ((a.category === "equities") ? (a.dividendYield ?? 0) > 0 : (a.income > 0 && a.category !== "property" && a.category !== "super")) && (
             <>
               <MiniField label="Fully franked?">
                 <select value={(a.frankedRate ?? 0) === 100 ? "yes" : (a.frankedRate ?? 0) === 0 ? "no" : "partial"} onChange={ev => {
@@ -2959,18 +3072,10 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
               </select>
             </MiniField>
           )}
-          {isProperty && (
-            <>
-              <MiniField label="Running expenses (yr)">
-                <NumberInput value={a.runningExpenses || 0} onChange={(v) => onChange({ runningExpenses: v })} style={miniInput} />
-              </MiniField>
-              <MiniField label="Owned by (for tax)">
-                <select value={a.earnerId || ""} onChange={e => onChange({ earnerId: e.target.value || null })} style={miniInput}>
-                  <option value="">— first AUD earner —</option>
-                  {earners.map(en => <option key={en.id} value={en.id}>{en.name}</option>)}
-                </select>
-              </MiniField>
-            </>
+          {isInvestmentProperty && (
+            <MiniField label="Running expenses (yr)">
+              <NumberInput value={a.runningExpenses || 0} onChange={(v) => onChange({ runningExpenses: v })} style={miniInput} />
+            </MiniField>
           )}
           {isProperty && (
             <div style={{ gridColumn: "1 / -1", marginTop: 4, paddingTop: 10, borderTop: `1px dashed ${C.line}` }}>
@@ -3011,12 +3116,6 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
                           <NumberInput value={loan.ioPeriod ?? 5} onChange={(v) => updateLoan(loan.id, { ioPeriod: v })} style={miniInput} integer />
                         </MiniField>
                       )}
-                      <MiniField label="Investment loan?">
-                        <select value={loan.isInvestment ? "yes" : "no"} onChange={e => updateLoan(loan.id, { isInvestment: e.target.value === "yes" })} style={miniInput}>
-                          <option value="no">No (PPR / not deductible)</option>
-                          <option value="yes">Yes (interest deductible)</option>
-                        </select>
-                      </MiniField>
                       <MiniField label="Offset balance ($)">
                         <NumberInput value={loan.offsetBalance || 0} onChange={(v) => updateLoan(loan.id, { offsetBalance: v })} style={miniInput} />
                       </MiniField>
@@ -3205,7 +3304,7 @@ function CashOptimisationEditor({ state, setState }) {
 
   // Build dropdown options
   const cashAssets = state.assets.filter(a => a.category === "cash");
-  const equityAssets = state.assets.filter(a => a.category === "equities" || a.category === "sharePlan");
+  const equityAssets = state.assets.filter(a => a.category === "equities");
   // Build list of all loans-with-offsets (asset-attached + standalone liabilities)
   const offsetLoans = [];
   state.assets.forEach(a => {
