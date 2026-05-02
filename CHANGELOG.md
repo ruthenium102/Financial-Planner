@@ -4,6 +4,30 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.5 — 2 May 2026
+
+**Offset moved onto the loan**
+- Mortgage offsets are now configured on the loan itself rather than as a separate asset.
+- Each loan's edit panel has an "Offset balance ($)" field — directly enter the dollar amount sitting in the offset.
+- Offset balances still appear as cash-like rows in the wealth chart (under the Cash stack), so net wealth is unchanged.
+- Auto-merge migration: any existing standalone "Mortgage Offset" assets that were linked to a loan have their balance moved onto the loan, and the standalone asset is deleted. No manual rework needed.
+- The "+ Add Mortgage Offset" button is removed from the Assets section.
+
+**Cash optimisation (sweep)**
+- New global setting under Assumptions: configure how excess cash gets handled at the end of each year.
+- Three modes:
+  - **Off** — cash stays as cash (default).
+  - **Offset account** — cash above the buffer fills the selected loan's offset (capped at the loan balance), with any spillover routed to the selected equity asset.
+  - **Equities** — cash above the buffer is added to the selected equity asset.
+- Required settings when enabled:
+  - Minimum cash buffer (a $ amount the user nominates)
+  - Source cash asset (which cash account to sweep from)
+  - Target offset loan and/or target equity asset (depending on mode)
+- Sweep happens at the end of each year, after all cashflow has been computed. So cash earned its growth/income for the year, then any surplus moves.
+- If sweeping to an offset and the loan can only absorb part of the excess (because the loan balance is smaller than the excess), the rest spills to the designated equity asset. This means once a loan is fully paid down, the sweep automatically flows to equities going forward.
+
+---
+
 ## v1.4 — 2 May 2026
 
 **Joint asset ownership**

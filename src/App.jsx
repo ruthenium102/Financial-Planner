@@ -68,7 +68,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.4";
+const VERSION = "v1.5";
 
 // =================================================================
 // Storage layer — Supabase when authenticated, localStorage as fallback
@@ -269,23 +269,54 @@ function migrateScenario(s) {
     })) : [],
   };
 
-  // Post-process: any cash asset referenced as an offset on any loan should be
-  // converted to category "offset" with growth/income cleared. This is a one-time
-  // migration to fix the conceptual bug where cash assets earned growth AND offset
-  // mortgage interest at the same time.
-  const offsetIds = new Set();
+  // Post-process: merge any "offset" or cash assets that were linked to a loan onto the loan
+  // itself as `loan.offsetBalance`. Then remove the standalone asset. The offset balance now
+  // lives on the loan and shows in the wealth chart via projection rows (under the "cash" stack).
+  const offsetAssetIds = new Set();
+  const balanceByOffsetId = {};
   out.assets.forEach(a => {
-    (a.loans || []).forEach(l => { if (l.offsetCashAssetId) offsetIds.add(l.offsetCashAssetId); });
+    if (a.category === "offset") balanceByOffsetId[a.id] = a.value || 0;
   });
-  out.liabilities.forEach(l => { if (l.offsetCashAssetId) offsetIds.add(l.offsetCashAssetId); });
-  if (offsetIds.size > 0) {
-    out.assets = out.assets.map(a => {
-      if (offsetIds.has(a.id) && a.category === "cash") {
-        return { ...a, category: "offset", growth: 0, income: 0, frankedRate: 0 };
-      }
-      return a;
-    });
+
+  // Walk all loans (in assets and liabilities), copy balance and mark the asset for removal
+  const moveBalanceOntoLoan = (loan) => {
+    const linkedId = loan.offsetCashAssetId;
+    if (!linkedId) return loan;
+    if (loan.offsetBalance == null) {
+      // Use the linked asset's value if it exists; else 0
+      loan.offsetBalance = balanceByOffsetId[linkedId] ?? 0;
+    }
+    offsetAssetIds.add(linkedId);
+    return { ...loan, offsetBalance: loan.offsetBalance, offsetCashAssetId: null };
+  };
+  out.assets = out.assets.map(a => ({
+    ...a,
+    loans: (a.loans || []).map(moveBalanceOntoLoan),
+  }));
+  out.liabilities = out.liabilities.map(l => moveBalanceOntoLoan(l));
+  // Remove the now-orphaned standalone offset assets
+  if (offsetAssetIds.size > 0) {
+    out.assets = out.assets.filter(a => !offsetAssetIds.has(a.id));
   }
+  // Default offsetBalance to 0 on any loan that doesn't have one set
+  out.assets = out.assets.map(a => ({
+    ...a,
+    loans: (a.loans || []).map(l => ({ ...l, offsetBalance: l.offsetBalance ?? 0 })),
+  }));
+  out.liabilities = out.liabilities.map(l => ({ ...l, offsetBalance: l.offsetBalance ?? 0 }));
+
+  // Cash optimisation defaults
+  if (!out.meta.cashOptimisation) {
+    out.meta.cashOptimisation = {
+      enabled: false,                // off by default
+      mode: "off",                   // "off" | "offset" | "equities"
+      minBuffer: 50000,              // user-editable $ floor
+      sweepSourceAssetId: null,      // designated cash asset to sweep from
+      sweepTargetOffsetLoanKey: null, // designated loan whose offset receives the sweep
+      sweepTargetEquityAssetId: null, // designated equity asset for spillover or pure-equities sweep
+    };
+  }
+
   return out;
 }
 
@@ -464,13 +495,15 @@ function project(state) {
 
   // Combined liability tracking: asset-attached loans + standalone liabilities
   let liabs = {};          // key → current balance
-  let loanMeta = {};       // key → { type, rate, termYears, yearsElapsed, isInvestment, assetId, earnerId, offsetCashAssetId }
+  let offsetByLoan = {};   // key → current offset balance (lives on loan, mutated by amortisation/sweep)
+  let loanMeta = {};       // key → { type, rate, termYears, yearsElapsed, isInvestment, assetId, earnerId }
   assets.forEach(a => {
     const loans = Array.isArray(a.loans) ? a.loans : (a.loan ? [a.loan] : []);
     loans.forEach(loan => {
       if (!loan || loan.balance <= 0) return;
       const key = `asset:${a.id}:${loan.id || "ln"}`;
       liabs[key] = loan.balance;
+      offsetByLoan[key] = loan.offsetBalance || 0;
       loanMeta[key] = {
         type: loan.type || "pi",
         rate: loan.rate || 0,
@@ -479,15 +512,15 @@ function project(state) {
         originalBalance: loan.originalBalance || loan.balance,
         yearsElapsed: 0,
         isInvestment: !!loan.isInvestment,
-        assetId: a.id,         // for routing rental income/expenses
-        earnerId: loan.earnerId || a.earnerId || null,  // who claims the deduction
-        offsetCashAssetId: loan.offsetCashAssetId || null,
+        assetId: a.id,
+        earnerId: loan.earnerId || a.earnerId || null,
       };
     });
   });
   liabilities.forEach(l => {
     const key = `liab:${l.id}`;
     liabs[key] = l.balance;
+    offsetByLoan[key] = l.offsetBalance || 0;
     loanMeta[key] = {
       type: l.type || "pi",
       rate: l.rate || 0,
@@ -498,7 +531,6 @@ function project(state) {
       isInvestment: !!l.isInvestment,
       assetId: null,
       earnerId: l.earnerId || null,
-      offsetCashAssetId: l.offsetCashAssetId || null,
     };
   });
 
@@ -548,12 +580,8 @@ function project(state) {
       if (!m) { interestThisYear[key] = 0; return; }
       // If full term has elapsed, no interest
       if (m.yearsElapsed >= m.termYears) { interestThisYear[key] = 0; return; }
-      // Offset: subtract linked cash asset balance from interest base
-      let offsetAmount = 0;
-      if (m.offsetCashAssetId) {
-        offsetAmount = Math.min(balances[m.offsetCashAssetId] || 0, liabs[key]);
-        if (offsetAmount < 0) offsetAmount = 0;
-      }
+      // Offset: subtract loan's own offsetBalance from interest base (capped at loan balance)
+      const offsetAmount = Math.min(Math.max(0, offsetByLoan[key] || 0), liabs[key]);
       const effectiveBalance = Math.max(0, liabs[key] - offsetAmount);
       interestThisYear[key] = effectiveBalance * (m.rate / 100);
     });
@@ -1021,8 +1049,50 @@ function project(state) {
       else if (cashAssets.length > 0) balances[cashAssets[0].id] += eventLump;
     }
 
+    // ===== End-of-year cash sweep automation =====
+    // If user has enabled cash optimisation, sweep cash above the buffer into the chosen target.
+    // Modes: "off" (no sweep) | "offset" (into a designated loan's offsetBalance) | "equities" (into a designated equity asset).
+    // For "offset" mode, if the target loan can only absorb part of the excess (because its balance
+    // is smaller than excess), the remainder spills to the designated equity asset.
+    const opt = meta.cashOptimisation || {};
+    if (opt.enabled && opt.mode && opt.mode !== "off") {
+      const sourceId = opt.sweepSourceAssetId;
+      const sourceAsset = assets.find(a => a.id === sourceId && a.category === "cash");
+      if (sourceAsset) {
+        const buffer = opt.minBuffer || 0;
+        let excess = (balances[sourceAsset.id] || 0) - buffer;
+        if (excess > 0) {
+          if (opt.mode === "offset" && opt.sweepTargetOffsetLoanKey) {
+            const loanKey = opt.sweepTargetOffsetLoanKey;
+            if (liabs[loanKey] != null) {
+              // Available room = loan balance − current offset balance
+              const room = Math.max(0, liabs[loanKey] - (offsetByLoan[loanKey] || 0));
+              const intoOffset = Math.min(excess, room);
+              if (intoOffset > 0) {
+                offsetByLoan[loanKey] = (offsetByLoan[loanKey] || 0) + intoOffset;
+                balances[sourceAsset.id] -= intoOffset;
+                excess -= intoOffset;
+              }
+            }
+          }
+          // Remaining excess (or pure equities mode) flows to the designated equity asset
+          if (excess > 0 && opt.sweepTargetEquityAssetId) {
+            const equityAsset = assets.find(a => a.id === opt.sweepTargetEquityAssetId && (a.category === "equities" || a.category === "sharePlan"));
+            if (equityAsset) {
+              balances[equityAsset.id] = (balances[equityAsset.id] || 0) + excess;
+              balances[sourceAsset.id] -= excess;
+            }
+          }
+        }
+      }
+    }
+    // ===== END cash sweep =====
+
     const byCat = { property: 0, equities: 0, cash: 0, offset: 0, super: 0, sharePlan: 0, other: 0 };
     assets.forEach(a => { byCat[a.category] = (byCat[a.category] || 0) + balances[a.id]; });
+    // Sum loan-attached offset balances into the cash stack for the wealth chart.
+    // (Offsets are conceptually cash that's reducing loan interest — still household money.)
+    Object.values(offsetByLoan).forEach(bal => { byCat.offset += bal || 0; });
     const totalAssets = Object.values(byCat).reduce((s, v) => s + v, 0);
     const totalLiab = Object.values(liabs).reduce((s, v) => s + v, 0);
     const netWealth = totalAssets - totalLiab;
@@ -1837,6 +1907,15 @@ export default function FinancialPlanner() {
             <NumberField label="Non-concessional cap" value={state.meta.nonConcessionalCap ?? NONCONCESSIONAL_CAP} step={1000} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, nonConcessionalCap: v } }))} />
             <NumberField label="Retirement spending %" value={(state.meta.retirementSpendingMultiplier ?? 0.75) * 100} step={5} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, retirementSpendingMultiplier: Math.max(0, v / 100) } }))} />
           </div>
+
+          {/* Cash optimisation panel */}
+          <div style={{ marginTop: 24, paddingTop: 16, borderTop: `1px solid ${C.line}` }}>
+            <div style={{ fontSize: 11, color: C.textDim, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 12 }}>
+              Cash Optimisation
+            </div>
+            <CashOptimisationEditor state={state} setState={setState} />
+          </div>
+
           <div style={{ marginTop: 12, fontSize: 10, color: C.textMute, letterSpacing: "0.05em" }}>
             Australian tax: ATO 2025–26 progressive + 2% Medicare. Singapore: IRAS resident YA2026. Super: 15% contribs tax on concessional contributions within cap; Division 293 (extra 15%) when income + concessional contribs exceed $250k; excess concessional taxed at marginal rate. Per-earner currency, tax method, and super contribution rates are set in the Income panel.
           </div>
@@ -2069,7 +2148,7 @@ export default function FinancialPlanner() {
             />
           </Section>
 
-          <Section title="Assets" subtitle="Property · equities · cash · offset · other" onAdd={addAsset} bordered>
+          <Section title="Assets" subtitle="Property · equities · cash · other" onAdd={addAsset} bordered>
             <DragList
               items={state.assets.filter(a => a.category !== "super")}
               getKey={(a) => a.id}
@@ -2083,9 +2162,6 @@ export default function FinancialPlanner() {
                 />
               )}
             />
-            <button onClick={addOffset} className="fp-btn" style={{ ...btnGhost, marginTop: 8, fontSize: 11 }}>
-              <Plus size={11} /> Add Mortgage Offset
-            </button>
           </Section>
 
           <Section title="School fees" subtitle="Per child · fees grow annually" onAdd={addKid} bordered>
@@ -2941,11 +3017,8 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
                           <option value="yes">Yes (interest deductible)</option>
                         </select>
                       </MiniField>
-                      <MiniField label="Offset from">
-                        <select value={loan.offsetCashAssetId || ""} onChange={e => updateLoan(loan.id, { offsetCashAssetId: e.target.value || null })} style={miniInput}>
-                          <option value="">— no offset —</option>
-                          {offsetAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                        </select>
+                      <MiniField label="Offset balance ($)">
+                        <NumberInput value={loan.offsetBalance || 0} onChange={(v) => updateLoan(loan.id, { offsetBalance: v })} style={miniInput} />
                       </MiniField>
                       <div style={{ gridColumn: "1 / -1" }}>
                         <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Annual payment (computed)</div>
@@ -3022,11 +3095,8 @@ function LiabRow({ l, earners = [], offsetAssets = [], editing, onEdit, onChange
               </select>
             </MiniField>
           )}
-          <MiniField label="Offset from">
-            <select value={l.offsetCashAssetId || ""} onChange={e => onChange({ offsetCashAssetId: e.target.value || null })} style={miniInput}>
-              <option value="">— no offset —</option>
-              {offsetAssets.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
+          <MiniField label="Offset balance ($)">
+            <NumberInput value={l.offsetBalance || 0} onChange={(v) => onChange({ offsetBalance: v })} style={miniInput} />
           </MiniField>
           <div>
             <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Annual payment (computed)</div>
@@ -3124,6 +3194,107 @@ function MiniField({ label, children }) {
 
 // Ownership editor — small grid showing each earner with a percentage input.
 // User-entered shares should sum to 100; we show a warning if they don't, but persist as entered.
+// Cash optimisation editor — global setting in Assumptions.
+// Configures whether/where to sweep excess cash above a buffer.
+function CashOptimisationEditor({ state, setState }) {
+  const opt = state.meta?.cashOptimisation || {
+    enabled: false, mode: "off", minBuffer: 50000,
+    sweepSourceAssetId: null, sweepTargetOffsetLoanKey: null, sweepTargetEquityAssetId: null,
+  };
+  const update = (patch) => setState(s => ({ ...s, meta: { ...s.meta, cashOptimisation: { ...opt, ...patch } } }));
+
+  // Build dropdown options
+  const cashAssets = state.assets.filter(a => a.category === "cash");
+  const equityAssets = state.assets.filter(a => a.category === "equities" || a.category === "sharePlan");
+  // Build list of all loans-with-offsets (asset-attached + standalone liabilities)
+  const offsetLoans = [];
+  state.assets.forEach(a => {
+    (a.loans || []).forEach(l => {
+      if (l.balance > 0) {
+        offsetLoans.push({
+          key: `asset:${a.id}:${l.id || "ln"}`,
+          label: `${a.name} loan (${fmt(l.balance)} @ ${l.rate}%)`,
+        });
+      }
+    });
+  });
+  state.liabilities.forEach(l => {
+    if (l.balance > 0) {
+      offsetLoans.push({
+        key: `liab:${l.id}`,
+        label: `${l.name} (${fmt(l.balance)} @ ${l.rate}%)`,
+      });
+    }
+  });
+
+  const fieldStyle = { background: "#0f0d0a", border: `1px solid ${C.line}`, color: C.text, padding: "6px 8px", fontSize: 12, fontFamily: "Inter Tight", width: "100%" };
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 14 }}>
+      <div>
+        <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Sweep excess cash to</div>
+        <select
+          value={opt.enabled ? opt.mode : "off"}
+          onChange={e => {
+            const v = e.target.value;
+            if (v === "off") update({ enabled: false, mode: "off" });
+            else update({ enabled: true, mode: v });
+          }}
+          style={fieldStyle}
+        >
+          <option value="off">Off (cash stays as cash)</option>
+          <option value="offset">Offset account</option>
+          <option value="equities">Equities</option>
+        </select>
+      </div>
+
+      {opt.enabled && (
+        <>
+          <div>
+            <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Minimum cash buffer</div>
+            <NumberInput value={opt.minBuffer || 0} step={1000} onChange={(v) => update({ minBuffer: v })} style={fieldStyle} />
+          </div>
+
+          <div>
+            <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Sweep from (cash asset)</div>
+            <select value={opt.sweepSourceAssetId || ""} onChange={e => update({ sweepSourceAssetId: e.target.value || null })} style={fieldStyle}>
+              <option value="">— select cash asset —</option>
+              {cashAssets.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+
+          {opt.mode === "offset" && (
+            <div>
+              <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Sweep to (offset loan)</div>
+              <select value={opt.sweepTargetOffsetLoanKey || ""} onChange={e => update({ sweepTargetOffsetLoanKey: e.target.value || null })} style={fieldStyle}>
+                <option value="">— select loan —</option>
+                {offsetLoans.map(l => <option key={l.key} value={l.key}>{l.label}</option>)}
+              </select>
+            </div>
+          )}
+
+          <div>
+            <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>
+              {opt.mode === "offset" ? "Spillover to (equity asset)" : "Sweep to (equity asset)"}
+            </div>
+            <select value={opt.sweepTargetEquityAssetId || ""} onChange={e => update({ sweepTargetEquityAssetId: e.target.value || null })} style={fieldStyle}>
+              <option value="">— select equity asset —</option>
+              {equityAssets.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+        </>
+      )}
+
+      {opt.enabled && (
+        <div style={{ gridColumn: "1 / -1", fontSize: 10, color: C.textMute, marginTop: 4 }}>
+          {opt.mode === "offset" && "At end of each year, cash above the buffer fills the selected offset (capped at loan balance), then any remainder spills to the selected equity asset."}
+          {opt.mode === "equities" && "At end of each year, cash above the buffer is added to the selected equity asset."}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function OwnershipEditor({ earners, shares, onChange }) {
   const sum = Object.values(shares || {}).reduce((s, v) => s + (Number(v) || 0), 0);
   const updateShare = (earnerId, value) => {
