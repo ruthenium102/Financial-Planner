@@ -48,6 +48,24 @@ const CATEGORY_META = {
 // Stack order (bottom to top in chart).
 const CATEGORY_ORDER = ["primaryResidence", "investmentProperty", "super", "equities", "other", "cash", "offset"];
 
+// Cashflow chart series — income above x-axis, expenses below.
+// Each series stacks; rentalPos/rentalNeg are split because rental net can be either sign.
+// Income shades: green family. Expenses: red/orange family. Same-hue gradient variation per series.
+const CASHFLOW_INCOME = [
+  { key: "cf_salary",      label: "Salary",        color: "#5B8F6F" },
+  { key: "cf_cashBonus",   label: "Cash bonus",    color: "#7FA87F" },
+  { key: "cf_assetIncome", label: "Asset income",  color: "#A6C49A" },
+  { key: "cf_rentalPos",   label: "Rental net",    color: "#8FB87B" },
+  { key: "cf_eventIncome", label: "Event income",  color: "#B5C99C" },
+];
+const CASHFLOW_EXPENSE = [
+  { key: "cf_living",        label: "Living expenses",  color: "#A0594F" },
+  { key: "cf_schoolFees",    label: "School fees",      color: "#B86F5C" },
+  { key: "cf_loanRepayments",label: "Loan repayments",  color: "#C96B6B" },
+  { key: "cf_rentalNeg",     label: "Rental loss",      color: "#9F4A48" },
+  { key: "cf_eventExpense",  label: "Event expense",    color: "#D08879" },
+];
+
 // ---------- Defaults ----------
 const DEFAULT_STATE = {
   meta: { currentAge: 40, horizonYears: 30, inflation: 2.5, currency: "AUD", fxSgdAud: 1.10, retirementSpendingMultiplier: 0.75 },
@@ -70,7 +88,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.6";
+const VERSION = "v1.7";
 
 
 // =================================================================
@@ -673,6 +691,12 @@ function project(state) {
     // ========== END PROPERTY TAX ATTRIBUTION ==========
 
     let totalGross = 0, totalNet = 0, totalTax = 0;
+    // Cashflow chart components — separately track each for stacking
+    let cfSalary = 0;        // base salaries across all earners (AUD)
+    let cfCashBonus = 0;     // cash bonuses across all earners (AUD)
+    // Net rental result (signed; can be negative-geared). Includes rental income minus running
+    // expenses minus deductible investment-loan interest. Computed from the rental block above.
+    let cfRentalNet = totalRentalIncome - totalRentalExpenses - totalInvestmentInterest;
     const superContribByEarner = {};   // total NET amount entering super (after contribs tax)
     const shareBonusByEarner = {};      // share bonus value (AUD) routed to share plan asset
 
@@ -904,6 +928,9 @@ function project(state) {
       totalGross += grossAud;
       totalNet += netAud;
       totalTax += taxAud;
+      // Cashflow chart components (salary base + cash bonuses; share bonuses go directly to shares)
+      cfSalary += baseAud;
+      cfCashBonus += bonusCashAud;
       superContribByEarner[e.id] = netSuperIn;
       shareBonusByEarner[e.id] = bonusSharesAud;
       earnerBreakdown[e.id] = {
@@ -1153,6 +1180,22 @@ function project(state) {
       loanBreakdown,
       // Engine internals exposed for the calculation Trace tab:
       totalLiabPayment, assetIncome, eventLump, eventExpense,
+      // ===== Cashflow chart fields =====
+      // Income-side (positive values stack above x-axis)
+      cf_salary: cfSalary,
+      cf_cashBonus: cfCashBonus,
+      cf_assetIncome: assetIncome,                                // dividends, interest from non-property assets
+      cf_rentalPos: cfRentalNet > 0 ? cfRentalNet : 0,            // positive when rent > expenses+interest
+      cf_eventIncome: eventLump > 0 ? eventLump : 0,              // one-off positive lumps
+      // Expense-side (negative values stack below x-axis)
+      cf_living: -expenses,
+      cf_schoolFees: -schoolFees,
+      cf_loanRepayments: -totalLiabPayment,
+      cf_rentalNeg: cfRentalNet < 0 ? cfRentalNet : 0,            // negative-gearing year
+      cf_eventExpense: -eventExpense,
+      // Net (pre-tax) — sum of all above
+      cf_netPretax: cfSalary + cfCashBonus + assetIncome + cfRentalNet + (eventLump > 0 ? eventLump : 0)
+                  - expenses - schoolFees - totalLiabPayment - eventExpense,
     });
 
     earners.forEach(e => {
@@ -2061,6 +2104,7 @@ export default function FinancialPlanner() {
                     </button>
                   ))}
                   <button onClick={() => setView("liabilities")} style={{ ...btnTab, background: view === "liabilities" ? C.accent : "transparent", color: view === "liabilities" ? C.bg : C.textDim }}>Liabilities</button>
+                  <button onClick={() => setView("cashflow")} style={{ ...btnTab, background: view === "cashflow" ? C.accent : "transparent", color: view === "cashflow" ? C.bg : C.textDim }}>Cashflow</button>
                 </div>
               </div>
             </div>
@@ -2093,6 +2137,19 @@ export default function FinancialPlanner() {
                         <stop offset="100%" stopColor={C.danger} stopOpacity={loan.gradBot} />
                       </linearGradient>
                     ))}
+                    {/* Cashflow gradients — income green ramp, expenses red/orange ramp */}
+                    {CASHFLOW_INCOME.map(s => (
+                      <linearGradient key={s.key} id={`grad-${s.key}`} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={s.color} stopOpacity={0.85} />
+                        <stop offset="100%" stopColor={s.color} stopOpacity={0.35} />
+                      </linearGradient>
+                    ))}
+                    {CASHFLOW_EXPENSE.map(s => (
+                      <linearGradient key={s.key} id={`grad-${s.key}`} x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={s.color} stopOpacity={0.35} />
+                        <stop offset="100%" stopColor={s.color} stopOpacity={0.85} />
+                      </linearGradient>
+                    ))}
                   </defs>
                   <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                   <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
@@ -2119,6 +2176,46 @@ export default function FinancialPlanner() {
                       name={loan.name}
                     />
                   ))}
+                  {/* Cashflow view: income stacked above x-axis, expenses below, net line on top */}
+                  {view === "cashflow" && (
+                    <>
+                      <ReferenceLine y={0} stroke={C.line} strokeWidth={1} />
+                      {CASHFLOW_INCOME.map(s => (
+                        <Area
+                          key={s.key}
+                          type="monotone"
+                          dataKey={s.key}
+                          stackId="cashflow"
+                          stroke={s.color}
+                          strokeWidth={0.5}
+                          fill={`url(#grad-${s.key})`}
+                          name={s.label}
+                        />
+                      ))}
+                      {CASHFLOW_EXPENSE.map(s => (
+                        <Area
+                          key={s.key}
+                          type="monotone"
+                          dataKey={s.key}
+                          stackId="cashflow"
+                          stroke={s.color}
+                          strokeWidth={0.5}
+                          fill={`url(#grad-${s.key})`}
+                          name={s.label}
+                        />
+                      ))}
+                      <Area
+                        type="monotone"
+                        dataKey="cf_netPretax"
+                        stroke="#FFFFFF"
+                        strokeWidth={1.5}
+                        fill="none"
+                        fillOpacity={0}
+                        dot={false}
+                        name="Net (pre-tax)"
+                      />
+                    </>
+                  )}
                   {CATEGORY_ORDER.includes(view) && (
                     <Area type="monotone" dataKey={view} stroke={CATEGORY_META[view].color} strokeWidth={2} fill={`url(#grad-${view})`} />
                   )}

@@ -4,6 +4,19 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.7 — 2 May 2026
+
+**Cashflow chart tab**
+- New "Cashflow" tab alongside Net Wealth / Stacked / Liabilities chart views.
+- Income stacks above the x-axis: Salary, Cash bonus, Asset income (dividends + interest), Rental net (when positive), Event income.
+- Expenses stack below the x-axis: Living expenses, School fees, Loan repayments (P&I total), Rental loss (when negative-geared), Event expenses.
+- White line overlaid on the stacks shows the Net (pre-tax) cashflow per year — i.e. income minus operating expenses, before tax.
+- Tax is intentionally excluded from this chart (it's a cashflow view, not a tax view). To see tax, use the Net Wealth or Stacked views and hover.
+- Real/Nominal toggle applies to this chart same as other views.
+- Investment property rental that's negative-geared in a given year shows as an expense band (below x-axis) rather than a tiny positive — keeps the visual honest.
+
+---
+
 ## v1.6 — 2 May 2026
 
 **Liability chart shows each loan stacked**
