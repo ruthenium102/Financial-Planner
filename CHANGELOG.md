@@ -4,16 +4,27 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.8 — 2 May 2026
+
+**Cashflow chart converted to stacked bars + tax included**
+- Switched from area chart to **stacked bar chart** so each year reads as a discrete column rather than a smoothed area.
+- **Income (green shades, above x-axis)**: Salary (gross), Cash bonus (gross), Asset income (interest + dividends), Rental net (when positive), Event income.
+- **Expenses (red shades, below x-axis)**: Living expenses, School fees, Loan repayments, **Tax** (now included), Rental loss (when negative-geared), Event expenses.
+- Share bonuses are excluded from the chart — they're not cash, just shares being granted. Dividends ON those shares (once held) do appear via Asset income.
+- Tax is shown as an expense band, since real money leaves your account regardless of which slice of income triggered it.
+- The white **Net** line shows true free cashflow per year (income minus all expenses including tax).
+- Real/Nominal toggle works the same as other views.
+
+---
+
 ## v1.7 — 2 May 2026
 
-**Cashflow chart tab**
+**Cashflow chart tab (initial version)**
 - New "Cashflow" tab alongside Net Wealth / Stacked / Liabilities chart views.
-- Income stacks above the x-axis: Salary, Cash bonus, Asset income (dividends + interest), Rental net (when positive), Event income.
-- Expenses stack below the x-axis: Living expenses, School fees, Loan repayments (P&I total), Rental loss (when negative-geared), Event expenses.
-- White line overlaid on the stacks shows the Net (pre-tax) cashflow per year — i.e. income minus operating expenses, before tax.
-- Tax is intentionally excluded from this chart (it's a cashflow view, not a tax view). To see tax, use the Net Wealth or Stacked views and hover.
-- Real/Nominal toggle applies to this chart same as other views.
-- Investment property rental that's negative-geared in a given year shows as an expense band (below x-axis) rather than a tiny positive — keeps the visual honest.
+- Income stacks above the x-axis: Salary, Cash bonus, Asset income, Rental net (when positive), Event income.
+- Expenses stack below the x-axis: Living expenses, School fees, Loan repayments, Rental loss, Event expenses.
+- White line overlaid showed Net (pre-tax). Tax was excluded.
+- (Replaced in v1.8: switched to bars, added tax as an expense.)
 
 ---
 

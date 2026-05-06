@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
+import { AreaChart, Area, ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 import { Plus, Trash2, TrendingUp, Settings, Download, Upload, RotateCcw, Edit2, X, Home, DollarSign, PiggyBank, Layers, GraduationCap, User, LogOut, Cloud, CloudOff } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 
@@ -62,8 +62,9 @@ const CASHFLOW_EXPENSE = [
   { key: "cf_living",        label: "Living expenses",  color: "#A0594F" },
   { key: "cf_schoolFees",    label: "School fees",      color: "#B86F5C" },
   { key: "cf_loanRepayments",label: "Loan repayments",  color: "#C96B6B" },
+  { key: "cf_tax",           label: "Tax",              color: "#D88080" },
   { key: "cf_rentalNeg",     label: "Rental loss",      color: "#9F4A48" },
-  { key: "cf_eventExpense",  label: "Event expense",    color: "#D08879" },
+  { key: "cf_eventExpense",  label: "Event expense",    color: "#D9967F" },
 ];
 
 // ---------- Defaults ----------
@@ -88,7 +89,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.7";
+const VERSION = "v1.8";
 
 
 // =================================================================
@@ -1181,7 +1182,7 @@ function project(state) {
       // Engine internals exposed for the calculation Trace tab:
       totalLiabPayment, assetIncome, eventLump, eventExpense,
       // ===== Cashflow chart fields =====
-      // Income-side (positive values stack above x-axis)
+      // Income-side (positive values stack above x-axis) — cash only, no share grants
       cf_salary: cfSalary,
       cf_cashBonus: cfCashBonus,
       cf_assetIncome: assetIncome,                                // dividends, interest from non-property assets
@@ -1192,10 +1193,11 @@ function project(state) {
       cf_schoolFees: -schoolFees,
       cf_loanRepayments: -totalLiabPayment,
       cf_rentalNeg: cfRentalNet < 0 ? cfRentalNet : 0,            // negative-gearing year
+      cf_tax: -totalTax,                                          // total household tax (income tax + Medicare + MLS + super excess)
       cf_eventExpense: -eventExpense,
-      // Net (pre-tax) — sum of all above
-      cf_netPretax: cfSalary + cfCashBonus + assetIncome + cfRentalNet + (eventLump > 0 ? eventLump : 0)
-                  - expenses - schoolFees - totalLiabPayment - eventExpense,
+      // Net cashflow — true free cash at end of year (income minus all expenses including tax)
+      cf_net: cfSalary + cfCashBonus + assetIncome + cfRentalNet + (eventLump > 0 ? eventLump : 0)
+            - expenses - schoolFees - totalLiabPayment - totalTax - eventExpense,
     });
 
     earners.forEach(e => {
@@ -2111,6 +2113,58 @@ export default function FinancialPlanner() {
 
             <div style={{ height: 380 }}>
               <ResponsiveContainer width="100%" height="100%">
+                {view === "cashflow" ? (
+                  <ComposedChart data={displayedProjection} margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
+                    onMouseMove={(e) => { if (e && e.activeLabel != null) setHoverYear(e.activeLabel); }}
+                    onMouseLeave={() => setHoverYear(null)}
+                  >
+                    <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
+                    <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
+                    <YAxis stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(v) => fmt(v)} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} width={60} />
+                    <Tooltip content={<CustomTooltip events={state.events} />} />
+                    <ReferenceLine y={0} stroke={C.lineHi} strokeWidth={1} />
+                    {CASHFLOW_INCOME.map(s => (
+                      <Bar
+                        key={s.key}
+                        dataKey={s.key}
+                        stackId="cashflow"
+                        fill={s.color}
+                        name={s.label}
+                        isAnimationActive={false}
+                      />
+                    ))}
+                    {CASHFLOW_EXPENSE.map(s => (
+                      <Bar
+                        key={s.key}
+                        dataKey={s.key}
+                        stackId="cashflow"
+                        fill={s.color}
+                        name={s.label}
+                        isAnimationActive={false}
+                      />
+                    ))}
+                    <Line
+                      type="monotone"
+                      dataKey="cf_net"
+                      stroke="#FFFFFF"
+                      strokeWidth={1.5}
+                      dot={false}
+                      name="Net"
+                      isAnimationActive={false}
+                    />
+                    {selectedYear != null && (
+                      <ReferenceLine x={selectedYear} stroke={C.selection} strokeDasharray="2 2" strokeWidth={1} />
+                    )}
+                    {state.events.filter(e => e.yearOffset != null).map(e => (
+                      <ReferenceLine key={e.id} x={e.yearOffset}
+                        stroke={e.type === "retirement" ? C.accent : C.lineHi}
+                        strokeDasharray={e.type === "retirement" ? "0" : "3 3"}
+                        strokeWidth={e.type === "retirement" ? 1.5 : 1}
+                        label={{ value: e.name, position: "top", fill: e.type === "retirement" ? C.accent : C.textMute, fontSize: 13, fontFamily: "Inter Tight", fontWeight: 400 }}
+                      />
+                    ))}
+                  </ComposedChart>
+                ) : (
                 <AreaChart data={displayedProjection} margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
                   onMouseMove={(e) => { if (e && e.activeLabel != null) setHoverYear(e.activeLabel); }}
                   onMouseLeave={() => setHoverYear(null)}
@@ -2176,46 +2230,6 @@ export default function FinancialPlanner() {
                       name={loan.name}
                     />
                   ))}
-                  {/* Cashflow view: income stacked above x-axis, expenses below, net line on top */}
-                  {view === "cashflow" && (
-                    <>
-                      <ReferenceLine y={0} stroke={C.line} strokeWidth={1} />
-                      {CASHFLOW_INCOME.map(s => (
-                        <Area
-                          key={s.key}
-                          type="monotone"
-                          dataKey={s.key}
-                          stackId="cashflow"
-                          stroke={s.color}
-                          strokeWidth={0.5}
-                          fill={`url(#grad-${s.key})`}
-                          name={s.label}
-                        />
-                      ))}
-                      {CASHFLOW_EXPENSE.map(s => (
-                        <Area
-                          key={s.key}
-                          type="monotone"
-                          dataKey={s.key}
-                          stackId="cashflow"
-                          stroke={s.color}
-                          strokeWidth={0.5}
-                          fill={`url(#grad-${s.key})`}
-                          name={s.label}
-                        />
-                      ))}
-                      <Area
-                        type="monotone"
-                        dataKey="cf_netPretax"
-                        stroke="#FFFFFF"
-                        strokeWidth={1.5}
-                        fill="none"
-                        fillOpacity={0}
-                        dot={false}
-                        name="Net (pre-tax)"
-                      />
-                    </>
-                  )}
                   {CATEGORY_ORDER.includes(view) && (
                     <Area type="monotone" dataKey={view} stroke={CATEGORY_META[view].color} strokeWidth={2} fill={`url(#grad-${view})`} />
                   )}
@@ -2238,6 +2252,7 @@ export default function FinancialPlanner() {
                     />
                   ))}
                 </AreaChart>
+                )}
               </ResponsiveContainer>
             </div>
 
