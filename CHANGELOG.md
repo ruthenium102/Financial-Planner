@@ -4,11 +4,29 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
-## v1.10 — 6 May 2026
+## v1.11 — 6 May 2026
 
 **Cashflow chart bars now align vertically**
-- Income and expense bars previously rendered side-by-side (horizontally dodged) because they used different stack IDs. Now they share a single stack ID and recharts splits them correctly by sign — positive values stack upward from the x-axis, negative values stack downward.
-- Result: bars are wider (no horizontal gap between income/expense halves) and visually aligned at the same x-position for each year.
+- Added `stackOffset="sign"` to the cashflow chart, which is recharts' built-in mode for splitting positive and negative values around the x-axis.
+- Income bars stack upward from zero, expense bars stack downward from zero, and they sit at the same x-position rather than being horizontally dodged.
+
+**Per-category chart views now stack each constituent asset**
+- The category-specific chart views (Primary Residence, Investment Property, Super, Shares, Other, Cash, Mortgage Offset) used to render as a single area showing the category total. They now stack each individual asset within the category as its own band, similar to how Liabilities already worked.
+- All bands within a category share the category's base color; gradient opacity varies per asset so they stay visually distinct while reading as one category.
+- For Mortgage Offset, each loan's offset balance shows as its own band, labelled "[asset name] offset".
+- The "Stacked" view (which shows all categories together) is unchanged — it stays at category-level grouping.
+
+**Per-category tooltip**
+- When viewing a single-category chart, the tooltip now shows only that category's constituents instead of the full net wealth breakdown.
+- Headline shows the category total (e.g. "Total Shares: $1.24M"). Each asset in the category is listed with its individual balance.
+- The "Stacked" and "Net wealth" views still get the original full-breakdown tooltip.
+
+---
+
+## v1.10 — 6 May 2026
+
+**Cashflow chart bars now align vertically (initial attempt)**
+- Income and expense bars previously rendered side-by-side (horizontally dodged) because they used different stack IDs. (Replaced in v1.11 with the cleaner `stackOffset="sign"` solution.)
 
 **Excess offset drain**
 - Previously, if a loan paid down faster than its offset balance, the excess offset got "trapped" — earning no interest savings (since the loan was already covered) and not invested anywhere productive.

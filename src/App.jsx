@@ -89,7 +89,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.10";
+const VERSION = "v1.11";
 
 
 // =================================================================
@@ -1199,12 +1199,29 @@ function project(state) {
       };
     });
 
+    // Per-asset balances flattened (assetbal_<assetId>) so per-category chart views can stack
+    // each individual asset within the category as its own band.
+    const assetFlat = {};
+    assets.forEach(a => {
+      assetFlat[`assetbal_${a.id}`] = balances[a.id] || 0;
+    });
+    // Per-loan offset balances flattened (offsetbal_<loanKey>) so the Mortgage Offset view can
+    // stack each loan's offset as its own band.
+    const offsetFlat = {};
+    Object.keys(offsetByLoan).forEach(key => {
+      offsetFlat[`offsetbal_${key}`] = offsetByLoan[key] || 0;
+    });
+
     rows.push({
       year: y, age, ...byCat, totalAssets, liabilities: totalLiab, netWealth, netCashflow,
       totalGross, totalNet, totalTax, expenses, expenseBreakdown,
       schoolFees, earnerBreakdown, feesByKid, allRetired, anyRetired, activeEvents,
       // Per-loan balance fields for stacked liability chart
       ...loanFlat,
+      // Per-asset balance fields for per-category stacked chart views
+      ...assetFlat,
+      // Per-loan offset balance fields for Mortgage Offset view
+      ...offsetFlat,
       loanBreakdown,
       // Engine internals exposed for the calculation Trace tab:
       totalLiabPayment, assetIncome, eventLump, eventExpense,
@@ -1676,6 +1693,56 @@ export default function FinancialPlanner() {
     });
   }, [state.assets, state.liabilities]);
 
+  // Build per-category asset lists for the per-category stacked chart views.
+  // Each entry: { key (used as dataKey), name, gradTop, gradBot } — gradient variation
+  // gives each asset within the same category a slightly different opacity so they read
+  // distinctly while remaining visually unified as one category.
+  const categoryAssetLists = useMemo(() => {
+    const lists = {};
+    // Single-asset categories: PR, IP, equities, super, other, cash
+    ["primaryResidence", "investmentProperty", "equities", "super", "other", "cash"].forEach(cat => {
+      const catAssets = state.assets.filter(a => a.category === cat);
+      lists[cat] = catAssets.map((a, idx) => {
+        const t = catAssets.length === 1 ? 0 : idx / (catAssets.length - 1);
+        return {
+          key: `assetbal_${a.id}`,
+          name: a.name,
+          gradTop: 0.85 - t * 0.35,
+          gradBot: 0.30 - t * 0.20,
+        };
+      });
+    });
+    // Mortgage Offset: list each loan's offset balance as its own band
+    const offsetEntries = [];
+    state.assets.forEach(a => {
+      (a.loans || []).forEach(l => {
+        if ((l.offsetBalance || 0) > 0) {
+          offsetEntries.push({
+            key: `offsetbal_asset:${a.id}:${l.id || "ln"}`,
+            name: `${a.name} offset`,
+          });
+        }
+      });
+    });
+    state.liabilities.forEach(l => {
+      if ((l.offsetBalance || 0) > 0) {
+        offsetEntries.push({
+          key: `offsetbal_liab:${l.id}`,
+          name: `${l.name} offset`,
+        });
+      }
+    });
+    lists.offset = offsetEntries.map((e, idx) => {
+      const t = offsetEntries.length === 1 ? 0 : idx / (offsetEntries.length - 1);
+      return {
+        ...e,
+        gradTop: 0.85 - t * 0.35,
+        gradBot: 0.30 - t * 0.20,
+      };
+    });
+    return lists;
+  }, [state.assets, state.liabilities]);
+
   const renameScenario = (oldName, newName) => {
     const trimmed = newName.trim();
     if (!trimmed || trimmed === oldName) return;
@@ -2141,7 +2208,7 @@ export default function FinancialPlanner() {
             <div style={{ height: 380 }}>
               <ResponsiveContainer width="100%" height="100%">
                 {view === "cashflow" ? (
-                  <ComposedChart data={displayedProjection} margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
+                  <ComposedChart data={displayedProjection} stackOffset="sign" margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
                     onMouseMove={(e) => { if (e && e.activeLabel != null) setHoverYear(e.activeLabel); }}
                     onMouseLeave={() => setHoverYear(null)}
                   >
@@ -2218,6 +2285,15 @@ export default function FinancialPlanner() {
                         <stop offset="100%" stopColor={C.danger} stopOpacity={loan.gradBot} />
                       </linearGradient>
                     ))}
+                    {/* Per-asset gradients for per-category stacked views — each asset varies opacity within its category color */}
+                    {Object.entries(categoryAssetLists).flatMap(([cat, list]) =>
+                      list.map(a => (
+                        <linearGradient key={`${cat}-${a.key}`} id={`grad-asset-${a.key}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor={CATEGORY_META[cat].color} stopOpacity={a.gradTop} />
+                          <stop offset="100%" stopColor={CATEGORY_META[cat].color} stopOpacity={a.gradBot} />
+                        </linearGradient>
+                      ))
+                    )}
                     {/* Cashflow gradients — income green ramp, expenses red/orange ramp */}
                     {CASHFLOW_INCOME.map(s => (
                       <linearGradient key={s.key} id={`grad-${s.key}`} x1="0" y1="0" x2="0" y2="1">
@@ -2235,7 +2311,7 @@ export default function FinancialPlanner() {
                   <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                   <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
                   <YAxis stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(v) => fmt(v)} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} width={60} />
-                  <Tooltip content={<CustomTooltip events={state.events} />} />
+                  <Tooltip content={<CustomTooltip events={state.events} view={view} categoryAssetLists={categoryAssetLists} />} />
                   {view === "stacked" && CATEGORY_ORDER.map(cat => (
                     <Area key={cat} type="monotone" dataKey={cat} stackId="1" stroke={CATEGORY_META[cat].color} strokeWidth={1} fill={`url(#grad-${cat})`} />
                   ))}
@@ -2257,9 +2333,21 @@ export default function FinancialPlanner() {
                       name={loan.name}
                     />
                   ))}
-                  {CATEGORY_ORDER.includes(view) && (
+                  {CATEGORY_ORDER.includes(view) && (categoryAssetLists[view] || []).length === 0 && (
                     <Area type="monotone" dataKey={view} stroke={CATEGORY_META[view].color} strokeWidth={2} fill={`url(#grad-${view})`} />
                   )}
+                  {CATEGORY_ORDER.includes(view) && (categoryAssetLists[view] || []).length > 0 && (categoryAssetLists[view] || []).map(a => (
+                    <Area
+                      key={a.key}
+                      type="monotone"
+                      dataKey={a.key}
+                      stackId={`cat-${view}`}
+                      stroke={CATEGORY_META[view].color}
+                      strokeWidth={1}
+                      fill={`url(#grad-asset-${a.key})`}
+                      name={a.name}
+                    />
+                  ))}
                   {selectedYear != null && (
                     <ReferenceLine
                       x={selectedYear}
@@ -2586,10 +2674,50 @@ function CashflowTooltip({ active, payload, label, events }) {
   );
 }
 
-function CustomTooltip({ active, payload, label, events }) {
+function CustomTooltip({ active, payload, label, events, view, categoryAssetLists = {} }) {
   if (!active || !payload || !payload.length) return null;
   const row = payload[0].payload;
   const activeEvts = events.filter(e => label >= e.yearOffset && label < e.yearOffset + (e.duration || 1));
+
+  // Per-category view: show only assets in the selected category
+  if (CATEGORY_ORDER.includes(view) && view !== "stacked") {
+    const meta = CATEGORY_META[view];
+    const list = categoryAssetLists[view] || [];
+    const total = row[view] || 0;
+    return (
+      <div style={{ background: C.panel, border: `1px solid ${C.lineHi}`, padding: "12px 14px", minWidth: 240, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+        <div style={{ fontSize: 10, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>
+          Year +{label} · Age {row.age}
+          {row.allRetired ? " · Both retired" : row.anyRetired ? " · Partial retirement" : ""}
+        </div>
+        <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>
+          Total {meta.label}
+        </div>
+        <div className="serif" style={{ fontSize: 20, fontStyle: "italic", color: meta.color, marginBottom: 10 }}>{fmtFull(total)}</div>
+        {list.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {list.map(a => (
+              <div key={a.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+                <span style={{ color: C.textDim, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 8, height: 8, background: meta.color, opacity: a.gradTop, display: "inline-block" }} />
+                  {a.name}
+                </span>
+                <span className="mono">{fmt(row[a.key] || 0)}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 11, color: C.textMute, fontStyle: "italic" }}>No {meta.label.toLowerCase()} assets</div>
+        )}
+        {activeEvts.length > 0 && (
+          <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${C.line}`, fontSize: 10, color: C.selection }}>
+            {activeEvts.map(e => e.name).join(" · ")}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   const earnerList = row.earnerBreakdown ? Object.values(row.earnerBreakdown) : [];
   const kidList = row.feesByKid ? Object.values(row.feesByKid) : [];
   return (
