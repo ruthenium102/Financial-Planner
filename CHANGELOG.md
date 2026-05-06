@@ -4,6 +4,23 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.12 — 6 May 2026
+
+**Liabilities tooltip**
+- Liabilities chart now has a dedicated tooltip showing the per-loan breakdown, matching the per-category tooltip style introduced in v1.11.
+- Headline shows total liabilities for the year. Each loan listed individually with its remaining balance.
+
+**Retirement event display fix**
+- Retirement events were showing a stale "$10k" amount in the events list because the default amount field stuck around when the event type changed to retirement.
+- Now the amount is hidden from display when an event is a retirement type. (Data is unchanged — only the display is suppressed.)
+
+**Smart event label staggering**
+- When two or more events fall close together on the timeline (e.g. partner retirements within a few years), their labels used to overlap and become unreadable.
+- Now labels are auto-staggered into vertical "lanes" — first event at the top, second event slightly below, and so on. Labels reset to the top lane when an event is far enough apart from previous events that there's no collision risk.
+- Lane spacing: 18px per lane. Collision threshold: events within 3 years of each other.
+
+---
+
 ## v1.11 — 6 May 2026
 
 **Cashflow chart bars now align vertically**

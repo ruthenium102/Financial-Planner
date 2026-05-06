@@ -89,7 +89,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.11";
+const VERSION = "v1.12";
 
 
 // =================================================================
@@ -1743,6 +1743,29 @@ export default function FinancialPlanner() {
     return lists;
   }, [state.assets, state.liabilities]);
 
+  // Smart event label staggering: assign each event a "lane" so labels don't collide.
+  // Sort events by yearOffset, then walk through. If an event is within COLLISION_YEARS of
+  // the previous event, push it to the next lane (lane 0 = top, lane 1 = below, etc.). If
+  // it's far enough apart from all previous events in higher lanes, reset to lane 0.
+  const eventLaneMap = useMemo(() => {
+    const COLLISION_YEARS = 3;          // events closer than this risk label collision
+    const sorted = [...state.events]
+      .filter(e => e.yearOffset != null)
+      .sort((a, b) => a.yearOffset - b.yearOffset);
+    const map = {};
+    const laneLastYear = []; // index = lane number, value = most recent yearOffset in that lane
+    sorted.forEach(ev => {
+      // Find the lowest lane where the gap is wide enough
+      let lane = 0;
+      while (lane < laneLastYear.length && (ev.yearOffset - laneLastYear[lane]) < COLLISION_YEARS) {
+        lane++;
+      }
+      laneLastYear[lane] = ev.yearOffset;
+      map[ev.id] = lane;
+    });
+    return map;
+  }, [state.events]);
+
   const renameScenario = (oldName, newName) => {
     const trimmed = newName.trim();
     if (!trimmed || trimmed === oldName) return;
@@ -2254,7 +2277,7 @@ export default function FinancialPlanner() {
                         stroke={e.type === "retirement" ? C.accent : C.lineHi}
                         strokeDasharray={e.type === "retirement" ? "0" : "3 3"}
                         strokeWidth={e.type === "retirement" ? 1.5 : 1}
-                        label={{ value: e.name, position: "top", fill: e.type === "retirement" ? C.accent : C.textMute, fontSize: 13, fontFamily: "Inter Tight", fontWeight: 400 }}
+                        label={{ value: e.name, position: "top", dy: (eventLaneMap[e.id] || 0) * 18, fill: e.type === "retirement" ? C.accent : C.textMute, fontSize: 13, fontFamily: "Inter Tight", fontWeight: 400 }}
                       />
                     ))}
                   </ComposedChart>
@@ -2311,7 +2334,7 @@ export default function FinancialPlanner() {
                   <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                   <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
                   <YAxis stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(v) => fmt(v)} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} width={60} />
-                  <Tooltip content={<CustomTooltip events={state.events} view={view} categoryAssetLists={categoryAssetLists} />} />
+                  <Tooltip content={<CustomTooltip events={state.events} view={view} categoryAssetLists={categoryAssetLists} loanList={loanList} />} />
                   {view === "stacked" && CATEGORY_ORDER.map(cat => (
                     <Area key={cat} type="monotone" dataKey={cat} stackId="1" stroke={CATEGORY_META[cat].color} strokeWidth={1} fill={`url(#grad-${cat})`} />
                   ))}
@@ -2363,7 +2386,7 @@ export default function FinancialPlanner() {
                       stroke={e.type === "retirement" ? C.accent : C.lineHi}
                       strokeDasharray={e.type === "retirement" ? "0" : "3 3"}
                       strokeWidth={e.type === "retirement" ? 1.5 : 1}
-                      label={{ value: e.name, position: "top", fill: e.type === "retirement" ? C.accent : C.textMute, fontSize: 13, fontFamily: "Inter Tight", fontWeight: 400 }}
+                      label={{ value: e.name, position: "top", dy: (eventLaneMap[e.id] || 0) * 18, fill: e.type === "retirement" ? C.accent : C.textMute, fontSize: 13, fontFamily: "Inter Tight", fontWeight: 400 }}
                     />
                   ))}
                 </AreaChart>
@@ -2674,10 +2697,47 @@ function CashflowTooltip({ active, payload, label, events }) {
   );
 }
 
-function CustomTooltip({ active, payload, label, events, view, categoryAssetLists = {} }) {
+function CustomTooltip({ active, payload, label, events, view, categoryAssetLists = {}, loanList = [] }) {
   if (!active || !payload || !payload.length) return null;
   const row = payload[0].payload;
   const activeEvts = events.filter(e => label >= e.yearOffset && label < e.yearOffset + (e.duration || 1));
+
+  // Liabilities view: show per-loan breakdown
+  if (view === "liabilities") {
+    const total = row.liabilities || 0;
+    return (
+      <div style={{ background: C.panel, border: `1px solid ${C.lineHi}`, padding: "12px 14px", minWidth: 240, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+        <div style={{ fontSize: 10, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>
+          Year +{label} · Age {row.age}
+          {row.allRetired ? " · Both retired" : row.anyRetired ? " · Partial retirement" : ""}
+        </div>
+        <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>
+          Total Liabilities
+        </div>
+        <div className="serif" style={{ fontSize: 20, fontStyle: "italic", color: C.danger, marginBottom: 10 }}>{fmtFull(total)}</div>
+        {loanList.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {loanList.map(loan => (
+              <div key={loan.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+                <span style={{ color: C.textDim, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ width: 8, height: 8, background: C.danger, opacity: loan.gradTop, display: "inline-block" }} />
+                  {loan.name}
+                </span>
+                <span className="mono">{fmt(row[`loan_${loan.key}`] || 0)}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 11, color: C.textMute, fontStyle: "italic" }}>No liabilities</div>
+        )}
+        {activeEvts.length > 0 && (
+          <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${C.line}`, fontSize: 10, color: C.selection }}>
+            {activeEvts.map(e => e.name).join(" · ")}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   // Per-category view: show only assets in the selected category
   if (CATEGORY_ORDER.includes(view) && view !== "stacked") {
@@ -2917,7 +2977,7 @@ function EventRow({ ev, maxYear, currentAge, earners, editing, onEdit, onChange,
             <div className="mono" style={{ fontSize: 10, color: C.textMute }}>
               Yr +{ev.yearOffset} · Age {currentAge + ev.yearOffset}
               {ev.duration > 1 && ev.type !== "retirement" && ` · ${ev.duration}y`}
-              {ev.amount > 0 && ` · ${fmt(ev.amount)}`}
+              {ev.amount > 0 && ev.type !== "retirement" && ` · ${fmt(ev.amount)}`}
               {earnerName && ` · ${earnerName}`}
             </div>
           </div>
