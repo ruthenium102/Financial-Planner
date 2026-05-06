@@ -4,6 +4,14 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.9 — 6 May 2026
+
+**Cashflow chart bugfixes**
+- Fixed bar stacking: income and expenses were sharing a single stack, causing positive bars to render on top of negative bars and obscure the actual cashflow shape. Now uses separate stack IDs so income stacks cleanly upward above the x-axis and expenses stack cleanly downward below it.
+- Fixed tooltip: the cashflow view was showing the net wealth tooltip (asset breakdown by category, total wealth at top, etc.) which was confusing and unrelated to the chart. Now has a dedicated cashflow tooltip showing year-by-year breakdown of income components (Salary, Cash bonus, Asset income, Rental net, Event income), expense components (Living, School fees, Loan repayments, Tax, Rental loss, Event expense), and the resulting Net cashflow with totals.
+
+---
+
 ## v1.8 — 2 May 2026
 
 **Cashflow chart converted to stacked bars + tax included**

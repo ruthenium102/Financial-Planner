@@ -89,7 +89,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.8";
+const VERSION = "v1.9";
 
 
 // =================================================================
@@ -2121,13 +2121,13 @@ export default function FinancialPlanner() {
                     <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                     <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
                     <YAxis stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(v) => fmt(v)} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} width={60} />
-                    <Tooltip content={<CustomTooltip events={state.events} />} />
+                    <Tooltip content={<CashflowTooltip events={state.events} />} />
                     <ReferenceLine y={0} stroke={C.lineHi} strokeWidth={1} />
                     {CASHFLOW_INCOME.map(s => (
                       <Bar
                         key={s.key}
                         dataKey={s.key}
-                        stackId="cashflow"
+                        stackId="cashflow-income"
                         fill={s.color}
                         name={s.label}
                         isAnimationActive={false}
@@ -2137,7 +2137,7 @@ export default function FinancialPlanner() {
                       <Bar
                         key={s.key}
                         dataKey={s.key}
-                        stackId="cashflow"
+                        stackId="cashflow-expense"
                         fill={s.color}
                         name={s.label}
                         isAnimationActive={false}
@@ -2490,6 +2490,71 @@ function Section({ title, subtitle, onAdd, bordered, children }) {
         <button onClick={onAdd} className="fp-btn" style={btnGhostSm}><Plus size={12} /></button>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>{children}</div>
+    </div>
+  );
+}
+
+// Cashflow-specific tooltip — shows income/expense breakdown for the year, not net wealth.
+function CashflowTooltip({ active, payload, label, events }) {
+  if (!active || !payload || !payload.length) return null;
+  const row = payload[0].payload;
+  const activeEvts = events.filter(e => label >= e.yearOffset && label < e.yearOffset + (e.duration || 1));
+  const totalIncome = (row.cf_salary || 0) + (row.cf_cashBonus || 0) + (row.cf_assetIncome || 0)
+                    + (row.cf_rentalPos || 0) + (row.cf_eventIncome || 0);
+  const totalExpense = (row.cf_living || 0) + (row.cf_schoolFees || 0) + (row.cf_loanRepayments || 0)
+                     + (row.cf_tax || 0) + (row.cf_rentalNeg || 0) + (row.cf_eventExpense || 0);
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.lineHi}`, padding: "12px 14px", minWidth: 260, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" }}>
+      <div style={{ fontSize: 10, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>
+        Year +{label} · Age {row.age}
+        {row.allRetired ? " · Both retired" : row.anyRetired ? " · Partial retirement" : ""}
+      </div>
+      <div className="serif" style={{ fontSize: 20, fontStyle: "italic", color: row.cf_net >= 0 ? C.good : C.danger, marginBottom: 10 }}>
+        {row.cf_net >= 0 ? "+" : ""}{fmtFull(row.cf_net)}
+      </div>
+      <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 4 }}>Income</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {CASHFLOW_INCOME.filter(s => (row[s.key] || 0) !== 0).map(s => (
+          <div key={s.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+            <span style={{ color: C.textDim, display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ width: 8, height: 8, background: s.color, display: "inline-block" }} />
+              {s.label}
+            </span>
+            <span className="mono" style={{ color: C.good }}>+{fmt(row[s.key] || 0)}</span>
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, paddingTop: 4, borderTop: `1px dashed ${C.line}`, marginTop: 2 }}>
+          <span style={{ color: C.text }}>Total income</span>
+          <span className="mono" style={{ color: C.good }}>+{fmt(totalIncome)}</span>
+        </div>
+      </div>
+      <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.15em", textTransform: "uppercase", marginTop: 10, marginBottom: 4 }}>Expenses</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {CASHFLOW_EXPENSE.filter(s => (row[s.key] || 0) !== 0).map(s => (
+          <div key={s.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+            <span style={{ color: C.textDim, display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ width: 8, height: 8, background: s.color, display: "inline-block" }} />
+              {s.label}
+            </span>
+            <span className="mono" style={{ color: C.danger }}>{fmt(row[s.key] || 0)}</span>
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, paddingTop: 4, borderTop: `1px dashed ${C.line}`, marginTop: 2 }}>
+          <span style={{ color: C.text }}>Total expenses</span>
+          <span className="mono" style={{ color: C.danger }}>{fmt(totalExpense)}</span>
+        </div>
+      </div>
+      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.line}`, display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+        <span style={{ color: C.text }}>Net</span>
+        <span className="mono" style={{ color: row.cf_net >= 0 ? C.good : C.danger, fontWeight: 500 }}>
+          {row.cf_net >= 0 ? "+" : ""}{fmt(row.cf_net)}
+        </span>
+      </div>
+      {activeEvts.length > 0 && (
+        <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${C.line}`, fontSize: 10, color: C.selection }}>
+          {activeEvts.map(e => e.name).join(" · ")}
+        </div>
+      )}
     </div>
   );
 }
