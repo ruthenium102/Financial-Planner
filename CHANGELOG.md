@@ -4,6 +4,20 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.10 — 6 May 2026
+
+**Cashflow chart bars now align vertically**
+- Income and expense bars previously rendered side-by-side (horizontally dodged) because they used different stack IDs. Now they share a single stack ID and recharts splits them correctly by sign — positive values stack upward from the x-axis, negative values stack downward.
+- Result: bars are wider (no horizontal gap between income/expense halves) and visually aligned at the same x-position for each year.
+
+**Excess offset drain**
+- Previously, if a loan paid down faster than its offset balance, the excess offset got "trapped" — earning no interest savings (since the loan was already covered) and not invested anywhere productive.
+- Now: at the end of each year, after the cash sweep, the engine checks each loan. If `offsetBalance > loanBalance`, the excess is automatically routed to the configured cash optimisation equity target. If no equity target is configured, the excess flows to the first cash asset.
+- Runs every year regardless of whether cash optimisation is enabled — this is a correctness fix, not an opt-in feature.
+- Self-corrects manually entered offset balances that exceed the loan amount.
+
+---
+
 ## v1.9 — 6 May 2026
 
 **Cashflow chart bugfixes**

@@ -89,7 +89,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.9";
+const VERSION = "v1.10";
 
 
 // =================================================================
@@ -1145,6 +1145,33 @@ function project(state) {
     }
     // ===== END cash sweep =====
 
+    // ===== Excess offset drain =====
+    // For each loan: if offset > loan balance, route the overflow somewhere productive.
+    // Route order: configured equity target → first cash asset.
+    // Runs every year regardless of whether cash optimisation is enabled.
+    Object.keys(offsetByLoan).forEach(key => {
+      const overflow = (offsetByLoan[key] || 0) - (liabs[key] || 0);
+      if (overflow > 0) {
+        offsetByLoan[key] = liabs[key] || 0;
+        // Try equity target first (if configured)
+        const optDrain = meta.cashOptimisation || {};
+        const equityTarget = optDrain.sweepTargetEquityAssetId
+          ? assets.find(a => a.id === optDrain.sweepTargetEquityAssetId && a.category === "equities")
+          : null;
+        if (equityTarget) {
+          balances[equityTarget.id] = (balances[equityTarget.id] || 0) + overflow;
+        } else {
+          // Fallback: first cash asset
+          const firstCash = assets.find(a => a.category === "cash");
+          if (firstCash) {
+            balances[firstCash.id] = (balances[firstCash.id] || 0) + overflow;
+          }
+          // If no cash asset either, the overflow is silently lost (rare; would mean no cash at all in scenario)
+        }
+      }
+    });
+    // ===== END excess offset drain =====
+
     const byCat = { primaryResidence: 0, investmentProperty: 0, equities: 0, cash: 0, offset: 0, super: 0, other: 0 };
     assets.forEach(a => { byCat[a.category] = (byCat[a.category] || 0) + balances[a.id]; });
     // Sum loan-attached offset balances into the cash stack for the wealth chart.
@@ -2127,7 +2154,7 @@ export default function FinancialPlanner() {
                       <Bar
                         key={s.key}
                         dataKey={s.key}
-                        stackId="cashflow-income"
+                        stackId="cashflow"
                         fill={s.color}
                         name={s.label}
                         isAnimationActive={false}
@@ -2137,7 +2164,7 @@ export default function FinancialPlanner() {
                       <Bar
                         key={s.key}
                         dataKey={s.key}
-                        stackId="cashflow-expense"
+                        stackId="cashflow"
                         fill={s.color}
                         name={s.label}
                         isAnimationActive={false}
