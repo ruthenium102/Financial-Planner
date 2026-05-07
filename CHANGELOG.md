@@ -4,6 +4,51 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.13 — 6 May 2026
+
+### ⚠️ Required action: Supabase migration
+
+Before deploying this version, run this SQL in your Supabase SQL Editor (Database → SQL Editor → New query):
+
+```sql
+ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS version integer DEFAULT 0;
+UPDATE scenarios SET version = 0 WHERE version IS NULL;
+```
+
+This adds the `version` column needed for the new optimistic concurrency check. Existing rows are stamped with version 0; new edits will increment from there.
+
+---
+
+**Optimistic concurrency for cloud saves**
+- Adds a per-scenario `version` integer in Supabase. Every save sends the version Claude expects to overwrite. If another device or browser tab has already saved a newer version, the database refuses the stale save.
+- When this happens, a "Save conflict" modal appears with two options:
+  - **Refresh** — discard local changes, reload latest version from cloud
+  - **Download backup** — save your current state to a file first, then refresh
+- This prevents the failure mode where you edit a scenario on your laptop, then accidentally overwrite those changes from a stale browser tab on another device.
+
+**Load / Save / Save As — file workflow**
+- Three new buttons in the header: Load, Save, Save As.
+- Default behaviour for new users is unchanged: cloud autosave to Supabase. The file workflow is opt-in.
+- **Load**: open a `.json` file from disk. If you have existing scenarios, you'll be prompted to either replace them or merge incoming scenarios alongside your current ones (with name collisions getting "(imported)" suffixes).
+- **Save**: writes to the currently-open file. Disabled if no file is open.
+- **Save As**: pick a new file location. Browser default location (typically `Downloads/`); no default filename suggested — type whatever you want.
+- File contents: a single JSON file containing all your scenarios.
+
+**File mode behaviour by browser**
+- **Chrome / Edge / Brave** (File System Access API): once you've opened or saved a file, autosave silently writes to that file on every change. The header status shows "Saved to {filename}".
+- **Safari / Firefox** (no File System Access API): autosave is disabled in file mode. You must click Save manually. Header shows "Unsaved · {filename}" when there are pending changes. Tab-close prompts a warning if you have unsaved changes.
+
+**Cloud and file are mutually exclusive while a file is open**
+- When a file is open, cloud autosave is paused — the file becomes the source of truth.
+- The cloud copy "freezes" at whatever was last there.
+- Click the small × in the file status indicator to close the file and resume cloud autosave from the current in-memory state.
+
+**Franking dropdown fix for investment properties**
+- The "Fully franked?" dropdown was showing on Investment Property assets, which doesn't make sense — rental income isn't dividend income, and franking only applies to AU-domiciled equities.
+- Now hidden for property categories. Only shown for Shares (equities) with a positive dividend yield.
+
+---
+
 ## v1.12 — 6 May 2026
 
 **Liabilities tooltip**

@@ -8,6 +8,44 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY;
 const SUPABASE_ENABLED = !!(SUPABASE_URL && SUPABASE_KEY);
+
+// ===== File workflow helpers =====
+// File System Access API support detection (Chrome/Edge/Brave on desktop = yes; Safari/Firefox = no)
+function canAutosaveToFile() {
+  return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function";
+}
+
+// Strip internal fields like _supabaseId and _version from each scenario before serialising to file.
+function stripInternalFields(scenarios) {
+  const clean = {};
+  for (const [name, scen] of Object.entries(scenarios || {})) {
+    const { _supabaseId, _version, ...rest } = scen || {};
+    clean[name] = rest;
+  }
+  return clean;
+}
+
+// Write scenarios to a FileSystemFileHandle (Chrome/Edge silent autosave path)
+async function writeJsonToFileHandle(handle, payload) {
+  const cleanPayload = { ...payload, scenarios: stripInternalFields(payload.scenarios) };
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(cleanPayload, null, 2));
+  await writable.close();
+}
+
+// Trigger a download of the given JSON payload (Safari/Firefox manual-save path)
+function downloadJson(payload, filename) {
+  const cleanPayload = { ...payload, scenarios: stripInternalFields(payload.scenarios) };
+  const blob = new Blob([JSON.stringify(cleanPayload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "the-ledger.json";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+}
 const supabase = SUPABASE_ENABLED ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
 // ---------- Design tokens ----------
@@ -89,7 +127,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.12";
+const VERSION = "v1.13";
 
 
 // =================================================================
@@ -118,7 +156,7 @@ async function loadFromSupabase(userId) {
   if (!supabase || !userId) return null;
   const { data: rows, error } = await supabase
     .from("scenarios")
-    .select("id, name, data")
+    .select("id, name, data, version")
     .eq("user_id", userId);
   if (error) {
     console.error("Supabase load error:", error);
@@ -126,37 +164,66 @@ async function loadFromSupabase(userId) {
   }
   if (!rows || rows.length === 0) return null;
   const scenarios = {};
-  rows.forEach(r => { scenarios[r.name] = { ...r.data, _supabaseId: r.id }; });
+  rows.forEach(r => { scenarios[r.name] = { ...r.data, _supabaseId: r.id, _version: r.version || 0 }; });
   // Pick first scenario alphabetically as active by default; useEffect will preserve user's choice
   const active = Object.keys(scenarios).sort()[0];
   return { scenarios, active };
 }
 
-// Save the entire wrapper to Supabase by upserting each scenario.
-// Uses _supabaseId on the scenario object to identify existing rows.
+// Save the entire wrapper to Supabase using per-row updates with optimistic concurrency.
+// For each existing row (has _supabaseId): UPDATE WHERE id = ? AND version = ?
+// If matched: row updated, returns new version.
+// If not matched: stale write detected — returns { stale: true, conflicts: [scenarioName, ...] }
+// New rows (no _supabaseId): plain insert.
 async function saveToSupabase(userId, data) {
   if (!supabase || !userId || !data?.scenarios) return { ok: false };
   const entries = Object.entries(data.scenarios);
-  // Build rows with user_id stamped
-  const rows = entries.map(([name, scenObj]) => {
-    const { _supabaseId, ...payload } = scenObj;
-    return _supabaseId
-      ? { id: _supabaseId, user_id: userId, name, data: payload }
-      : { user_id: userId, name, data: payload };
-  });
-  // Upsert (insert new, update existing by id)
-  const { data: upserted, error } = await supabase
-    .from("scenarios")
-    .upsert(rows, { onConflict: "id" })
-    .select("id, name");
-  if (error) {
-    console.error("Supabase save error:", error);
-    return { ok: false, error };
-  }
-  // Return id-mapped names so the caller can stamp _supabaseId back onto the in-memory state
   const idByName = {};
-  upserted?.forEach(r => { idByName[r.name] = r.id; });
-  return { ok: true, idByName };
+  const versionByName = {};
+  const conflicts = [];
+
+  for (const [name, scenObj] of entries) {
+    const { _supabaseId, _version, ...payload } = scenObj;
+    if (_supabaseId) {
+      // Existing row — optimistic concurrency update
+      const expectedVersion = _version || 0;
+      const { data: updated, error } = await supabase
+        .from("scenarios")
+        .update({ name, data: payload, version: expectedVersion + 1 })
+        .eq("id", _supabaseId)
+        .eq("version", expectedVersion)
+        .select("id, name, version");
+      if (error) {
+        console.error("Supabase update error:", error);
+        return { ok: false, error };
+      }
+      if (!updated || updated.length === 0) {
+        // Row exists but version didn't match — stale write
+        conflicts.push(name);
+      } else {
+        idByName[name] = updated[0].id;
+        versionByName[name] = updated[0].version;
+      }
+    } else {
+      // New row — insert
+      const { data: inserted, error } = await supabase
+        .from("scenarios")
+        .insert({ user_id: userId, name, data: payload, version: 1 })
+        .select("id, name, version");
+      if (error) {
+        console.error("Supabase insert error:", error);
+        return { ok: false, error };
+      }
+      if (inserted && inserted[0]) {
+        idByName[name] = inserted[0].id;
+        versionByName[name] = inserted[0].version;
+      }
+    }
+  }
+  if (conflicts.length > 0) {
+    return { ok: false, stale: true, conflicts, idByName, versionByName };
+  }
+  return { ok: true, idByName, versionByName };
 }
 
 // Delete a scenario row from Supabase by id
@@ -1471,7 +1538,6 @@ export default function FinancialPlanner() {
   const [renameValue, setRenameValue] = useState("");
   const [toast, setToast] = useState(null);
   const [confirmModal, setConfirmModal] = useState(null);
-  const fileInputRef = useRef(null);
 
   // Auto-dismiss toasts after 3s
   useEffect(() => {
@@ -1524,12 +1590,13 @@ export default function FinancialPlanner() {
       if (loadedData && loadedData.scenarios) {
         const migrated = {};
         Object.entries(loadedData.scenarios).forEach(([name, scen]) => {
-          // Capture supabase id into the ref (not state)
+          // Capture supabase id and version into refs (not state)
           if (scen._supabaseId) supabaseIdByName.current[name] = scen._supabaseId;
+          if (scen._version != null) supabaseVersionByName.current[name] = scen._version;
           const m = migrateScenario(scen);
           if (m) {
-            // Strip _supabaseId from state so it never triggers re-saves
-            const { _supabaseId, ...clean } = m;
+            // Strip internal fields from state so they never trigger re-saves
+            const { _supabaseId, _version, ...clean } = m;
             migrated[name] = clean;
           }
         });
@@ -1553,38 +1620,84 @@ export default function FinancialPlanner() {
 
   // Track Supabase row IDs by scenario name in a ref — does NOT trigger re-renders or re-saves
   const supabaseIdByName = useRef({});
+  // Track the last-known Supabase version per scenario for optimistic concurrency
+  const supabaseVersionByName = useRef({});
+  // Stale-write modal state: shown when a save fails because version is stale
+  const [staleConflict, setStaleConflict] = useState(null); // null | { conflicts: string[] }
+  // File workflow state
+  const [fileHandle, setFileHandle] = useState(null);       // FileSystemFileHandle if Chrome/Edge with file open
+  const [fileName, setFileName] = useState(null);            // Display filename (without .json)
+  const [fileDirty, setFileDirty] = useState(false);         // Has changed since last manual save (Safari only)
+  const [fileSyncStatus, setFileSyncStatus] = useState("idle"); // "idle" | "saving" | "saved" | "error"
 
   // ===== Save scenarios on change =====
-  // Debounced save: when scenarios change, wait 800ms then persist. Avoids spamming Supabase
-  // on every keystroke. Also writes to localStorage as a fallback cache.
+  // File mode (fileHandle set): writes to the local file. On Chrome/Edge with File System
+  //   Access API, writes silently. On Safari/Firefox, marks dirty and waits for manual Save.
+  // Cloud mode (no fileHandle): debounced save to Supabase with optimistic concurrency.
+  // localStorage cache always written either way.
   useEffect(() => {
     if (!loaded) return;
     saveToLocalStorage({ scenarios, active: activeScenario }); // always cache locally
+
+    // === File mode: writing to local file ===
+    if (fileHandle) {
+      if (canAutosaveToFile()) {
+        // Chrome/Edge: silently autosave to file
+        setFileSyncStatus("saving");
+        const handle = setTimeout(async () => {
+          try {
+            await writeJsonToFileHandle(fileHandle, { scenarios, active: activeScenario });
+            setFileSyncStatus("saved");
+            setFileDirty(false);
+          } catch (err) {
+            console.error("File autosave error:", err);
+            setFileSyncStatus("error");
+          }
+        }, 800);
+        return () => clearTimeout(handle);
+      } else {
+        // Safari/Firefox: just mark dirty; user must click Save manually
+        setFileDirty(true);
+        return;
+      }
+    }
+
+    // === Cloud mode ===
     if (!SUPABASE_ENABLED || !session?.user?.id) return;
     setSyncStatus("saving");
     const handle = setTimeout(async () => {
-      // Build scenarios with _supabaseId stamped from the ref (so upsert uses UPDATE for known rows)
+      // Build scenarios with _supabaseId AND _version stamped from refs
       const scenariosWithIds = {};
       for (const [name, scen] of Object.entries(scenarios)) {
-        scenariosWithIds[name] = supabaseIdByName.current[name]
-          ? { ...scen, _supabaseId: supabaseIdByName.current[name] }
-          : scen;
+        const stamped = { ...scen };
+        if (supabaseIdByName.current[name]) stamped._supabaseId = supabaseIdByName.current[name];
+        if (supabaseVersionByName.current[name] != null) stamped._version = supabaseVersionByName.current[name];
+        scenariosWithIds[name] = stamped;
       }
       const result = await saveToSupabase(session.user.id, { scenarios: scenariosWithIds, active: activeScenario });
+      // Always update the ID/version refs from whatever rows did succeed
+      if (result.idByName) {
+        for (const [name, id] of Object.entries(result.idByName)) {
+          supabaseIdByName.current[name] = id;
+        }
+      }
+      if (result.versionByName) {
+        for (const [name, ver] of Object.entries(result.versionByName)) {
+          supabaseVersionByName.current[name] = ver;
+        }
+      }
       if (result.ok) {
         setSyncStatus("idle");
-        // Update the ref with any new IDs from the response — does not trigger re-render
-        if (result.idByName) {
-          for (const [name, id] of Object.entries(result.idByName)) {
-            supabaseIdByName.current[name] = id;
-          }
-        }
+      } else if (result.stale) {
+        // Stale write conflict — show modal so user can choose
+        setSyncStatus("error");
+        setStaleConflict({ conflicts: result.conflicts });
       } else {
         setSyncStatus("error");
       }
     }, 800);
     return () => clearTimeout(handle);
-  }, [scenarios, activeScenario, loaded, session?.user?.id]);
+  }, [scenarios, activeScenario, loaded, session?.user?.id, fileHandle]);
 
   const state = scenarios[activeScenario] || DEFAULT_STATE;
 
@@ -1595,6 +1708,190 @@ export default function FinancialPlanner() {
       return { ...prev, [activeScenario]: next };
     });
   };
+
+  // ===== File workflow: Load / Save / Save As =====
+  const handleLoad = async () => {
+    try {
+      // Use showOpenFilePicker if available, else fall back to <input type="file">
+      let file;
+      let handle = null;
+      if (typeof window.showOpenFilePicker === "function") {
+        const [h] = await window.showOpenFilePicker({
+          types: [{ description: "The Ledger scenarios", accept: { "application/json": [".json"] } }],
+          multiple: false,
+        });
+        handle = h;
+        file = await h.getFile();
+      } else {
+        // Safari/Firefox fallback: hidden file input
+        file = await new Promise((resolve, reject) => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".json,application/json";
+          input.onchange = () => input.files[0] ? resolve(input.files[0]) : reject(new Error("No file selected"));
+          input.click();
+        });
+      }
+      const text = await file.text();
+      const payload = JSON.parse(text);
+      if (!payload?.scenarios || typeof payload.scenarios !== "object") {
+        setToast({ kind: "err", msg: "File doesn't contain valid scenarios" });
+        return;
+      }
+      const incomingNames = Object.keys(payload.scenarios);
+      const existingNames = Object.keys(scenarios);
+      const hasExisting = existingNames.length > 0;
+      // Migrate incoming scenarios
+      const migratedIncoming = {};
+      for (const [name, scen] of Object.entries(payload.scenarios)) {
+        const m = migrateScenario(scen);
+        if (m) {
+          const { _supabaseId, _version, ...clean } = m;
+          migratedIncoming[name] = clean;
+        }
+      }
+      // If no existing scenarios, just load
+      if (!hasExisting) {
+        setScenarios(migratedIncoming);
+        setActiveScenario(payload.active && migratedIncoming[payload.active] ? payload.active : Object.keys(migratedIncoming)[0]);
+        // Set file mode
+        const baseName = file.name.replace(/\.json$/i, "");
+        setFileHandle(handle);
+        setFileName(baseName);
+        setFileDirty(false);
+        setFileSyncStatus("saved");
+        setToast({ kind: "ok", msg: `Loaded ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
+        return;
+      }
+      // Existing scenarios present → ask user: replace or merge?
+      setConfirmModal({
+        title: "Load scenarios from file",
+        msg: `This file contains ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"}: ${incomingNames.join(", ")}. You currently have ${existingNames.length} scenario${existingNames.length === 1 ? "" : "s"}. What would you like to do?`,
+        confirmLabel: "Replace all",
+        cancelLabel: "Merge in",
+        onConfirm: () => {
+          // Replace
+          setScenarios(migratedIncoming);
+          setActiveScenario(payload.active && migratedIncoming[payload.active] ? payload.active : Object.keys(migratedIncoming)[0]);
+          const baseName = file.name.replace(/\.json$/i, "");
+          setFileHandle(handle);
+          setFileName(baseName);
+          setFileDirty(false);
+          setFileSyncStatus("saved");
+          setToast({ kind: "ok", msg: `Replaced with ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
+        },
+        onCancel: () => {
+          // Merge — incoming scenarios added; name collisions get "(imported)" suffix
+          const merged = { ...scenarios };
+          for (const [name, scen] of Object.entries(migratedIncoming)) {
+            let finalName = name;
+            if (merged[finalName]) {
+              let i = 1;
+              while (merged[`${name} (imported${i > 1 ? ` ${i}` : ""})`]) i++;
+              finalName = `${name} (imported${i > 1 ? ` ${i}` : ""})`;
+            }
+            merged[finalName] = scen;
+          }
+          setScenarios(merged);
+          const baseName = file.name.replace(/\.json$/i, "");
+          setFileHandle(handle);
+          setFileName(baseName);
+          setFileDirty(false);
+          setFileSyncStatus("saved");
+          setToast({ kind: "ok", msg: `Merged ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
+        },
+      });
+    } catch (err) {
+      if (err && err.name !== "AbortError") {
+        console.error("Load error:", err);
+        setToast({ kind: "err", msg: "Failed to load file" });
+      }
+    }
+  };
+
+  const handleSave = async () => {
+    // If we have a file handle and the API is available, write silently to that file
+    const payload = { scenarios, active: activeScenario };
+    if (fileHandle && canAutosaveToFile()) {
+      try {
+        setFileSyncStatus("saving");
+        await writeJsonToFileHandle(fileHandle, payload);
+        setFileSyncStatus("saved");
+        setFileDirty(false);
+        setToast({ kind: "ok", msg: `Saved to ${fileName}` });
+      } catch (err) {
+        console.error("Save error:", err);
+        setFileSyncStatus("error");
+        setToast({ kind: "err", msg: "Failed to save file" });
+      }
+      return;
+    }
+    // Otherwise, behave like Save As (or Safari fallback download)
+    if (fileHandle && fileName) {
+      // We had a file picked from <input> earlier (Safari/Firefox); download with same filename
+      downloadJson(payload, `${fileName}.json`);
+      setFileDirty(false);
+      setToast({ kind: "ok", msg: `Downloaded ${fileName}.json` });
+      return;
+    }
+    // No file at all yet → Save As
+    handleSaveAs();
+  };
+
+  const handleSaveAs = async () => {
+    const payload = { scenarios, active: activeScenario };
+    if (canAutosaveToFile()) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          types: [{ description: "The Ledger scenarios", accept: { "application/json": [".json"] } }],
+        });
+        await writeJsonToFileHandle(handle, payload);
+        const file = await handle.getFile();
+        const baseName = file.name.replace(/\.json$/i, "");
+        setFileHandle(handle);
+        setFileName(baseName);
+        setFileDirty(false);
+        setFileSyncStatus("saved");
+        setToast({ kind: "ok", msg: `Saved as ${baseName}` });
+      } catch (err) {
+        if (err && err.name !== "AbortError") {
+          console.error("Save As error:", err);
+          setToast({ kind: "err", msg: "Failed to save file" });
+        }
+      }
+    } else {
+      // Safari/Firefox: trigger download. User picks filename via download dialog.
+      downloadJson(payload, "the-ledger.json");
+      // Set a marker so subsequent Save uses download flow with this name
+      setFileHandle({ _safari: true });
+      setFileName("the-ledger");
+      setFileDirty(false);
+      setToast({ kind: "ok", msg: "Downloaded the-ledger.json" });
+    }
+  };
+
+  // Close the current file (return to cloud autosave mode)
+  const handleCloseFile = () => {
+    setFileHandle(null);
+    setFileName(null);
+    setFileDirty(false);
+    setFileSyncStatus("idle");
+    setToast({ kind: "ok", msg: "Closed file. Cloud autosave resumed." });
+  };
+
+  // Tab-close warning when there are unsaved changes in file mode (Safari/Firefox path)
+  useEffect(() => {
+    if (!fileHandle || canAutosaveToFile()) return; // not in manual-save mode
+    if (!fileDirty) return; // nothing dirty
+    const handler = (e) => {
+      e.preventDefault();
+      e.returnValue = "You have unsaved changes. Save before closing?";
+      return e.returnValue;
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [fileHandle, fileDirty]);
+
 
   // Reorder helpers — used by drag-to-reorder
   const reorderEarners = (next) => setState(s => ({ ...s, earners: next }));
@@ -1825,87 +2122,6 @@ export default function FinancialPlanner() {
     });
   };
 
-  // --- Export / Import ---
-  const download = (payload, filename) => {
-    try {
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, 100);
-      setToast({ kind: "ok", msg: `Saved ${filename}` });
-    } catch (err) {
-      // Fallback: open data URL in new tab so user can save manually
-      try {
-        const dataUrl = "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
-        window.open(dataUrl, "_blank");
-        setToast({ kind: "warn", msg: "Download may be blocked — opened in new tab. Right-click → Save As." });
-      } catch (e2) {
-        setToast({ kind: "err", msg: "Could not save: " + err.message });
-      }
-    }
-  };
-
-  const saveAs = () => {
-    download(
-      { name: activeScenario, scenario: state, exportedAt: new Date().toISOString(), version: 4 },
-      `scenario-${activeScenario.replace(/\s+/g, "-").toLowerCase()}-${new Date().toISOString().slice(0, 10)}.json`
-    );
-  };
-
-  const handleImport = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const data = JSON.parse(evt.target.result);
-        if (data.scenarios) {
-          const migrated = {};
-          Object.entries(data.scenarios).forEach(([n, s]) => {
-            const m = migrateScenario(s);
-            if (m) migrated[n] = m;
-          });
-          const overwriteCount = Object.keys(migrated).filter(n => scenarios[n]).length;
-          const msg = overwriteCount > 0
-            ? `Import ${Object.keys(migrated).length} scenarios? ${overwriteCount} existing scenario(s) with the same name will be overwritten.`
-            : `Import ${Object.keys(migrated).length} scenarios?`;
-          setConfirmModal({
-            msg,
-            onConfirm: () => {
-              setScenarios(prev => ({ ...prev, ...migrated }));
-              if (data.active && migrated[data.active]) setActiveScenario(data.active);
-              setToast({ kind: "ok", msg: `Imported ${Object.keys(migrated).length} scenarios` });
-            },
-          });
-        } else if (data.scenario && data.name) {
-          const migrated = migrateScenario(data.scenario);
-          if (!migrated) {
-            setToast({ kind: "err", msg: "Scenario data is invalid" });
-            return;
-          }
-          const name = data.name;
-          setScenarios(prev => ({ ...prev, [name]: migrated }));
-          setActiveScenario(name);
-          setToast({ kind: "ok", msg: `Imported "${name}"` });
-        } else {
-          setToast({ kind: "err", msg: "Unrecognised file format" });
-        }
-      } catch (err) {
-        setToast({ kind: "err", msg: "Could not parse file: " + err.message });
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = "";
-  };
-
   // --- CRUD helpers ---
   const addAsset = () => {
     const id = `a${Date.now()}`;
@@ -2043,18 +2259,39 @@ export default function FinancialPlanner() {
           <div style={{ color: C.textMute, fontSize: 11, letterSpacing: "0.2em", textTransform: "uppercase" }}>Long-range financial scenarios</div>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-          {SUPABASE_ENABLED && session && (
+          {/* Status: file mode shows file status; cloud mode shows sync status */}
+          {fileHandle ? (
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8, fontSize: 10, color: C.textMute, letterSpacing: "0.05em" }}>
-              {syncStatus === "saving" && <><Cloud size={11} /> Saving…</>}
-              {syncStatus === "idle" && <><Cloud size={11} color={C.good} /> Synced</>}
-              {syncStatus === "error" && <><CloudOff size={11} color={C.danger} /> Save failed</>}
+              {fileSyncStatus === "saving" && <><Download size={11} /> Saving…</>}
+              {fileSyncStatus === "saved" && !fileDirty && <><Download size={11} color={C.good} /> Saved to {fileName}</>}
+              {fileDirty && <><Download size={11} color={C.danger} /> Unsaved · {fileName}</>}
+              {fileSyncStatus === "error" && <><Download size={11} color={C.danger} /> Save failed · {fileName}</>}
+              <button onClick={handleCloseFile} className="fp-btn" style={{ ...btnGhost, padding: "2px 6px", fontSize: 9, marginLeft: 4 }} title="Close file and return to cloud autosave">
+                <X size={9} />
+              </button>
             </div>
+          ) : (
+            SUPABASE_ENABLED && session && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8, fontSize: 10, color: C.textMute, letterSpacing: "0.05em" }}>
+                {syncStatus === "saving" && <><Cloud size={11} /> Saving…</>}
+                {syncStatus === "idle" && <><Cloud size={11} color={C.good} /> Synced</>}
+                {syncStatus === "error" && <><CloudOff size={11} color={C.danger} /> Save failed</>}
+              </div>
+            )
           )}
-          <input ref={fileInputRef} type="file" accept="application/json" onChange={handleImport} style={{ display: "none" }} />
-          <button onClick={() => fileInputRef.current?.click()} className="fp-btn" style={btnGhost} title="Load scenarios from file">
+          <button onClick={handleLoad} className="fp-btn" style={btnGhost} title="Load scenarios from a file">
             <Upload size={13} /> Load
           </button>
-          <button onClick={saveAs} className="fp-btn" style={btnGhost} title="Save current scenario to file">
+          <button
+            onClick={handleSave}
+            className="fp-btn"
+            style={{ ...btnGhost, opacity: fileHandle ? 1 : 0.5 }}
+            disabled={!fileHandle}
+            title={fileHandle ? `Save to ${fileName}` : "No file open — use Save As first"}
+          >
+            <Download size={13} /> Save
+          </button>
+          <button onClick={handleSaveAs} className="fp-btn" style={btnGhost} title="Save scenarios to a new file">
             <Download size={13} /> Save As
           </button>
           <button onClick={() => setShowSettings(!showSettings)} className="fp-btn" style={btnGhost}>
@@ -2599,14 +2836,63 @@ export default function FinancialPlanner() {
             background: C.panel, border: `1px solid ${C.lineHi}`, padding: 24,
             maxWidth: 440, boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
           }}>
-            <div className="serif" style={{ fontSize: 18, fontStyle: "italic", marginBottom: 12 }}>Confirm</div>
+            <div className="serif" style={{ fontSize: 18, fontStyle: "italic", marginBottom: 12 }}>{confirmModal.title || "Confirm"}</div>
             <div style={{ fontSize: 13, color: C.textDim, marginBottom: 20, lineHeight: 1.5 }}>{confirmModal.msg}</div>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button onClick={() => setConfirmModal(null)} className="fp-btn" style={btnGhost}>Cancel</button>
+              <button onClick={() => { confirmModal.onCancel?.(); setConfirmModal(null); }} className="fp-btn" style={btnGhost}>
+                {confirmModal.cancelLabel || "Cancel"}
+              </button>
               <button onClick={() => { confirmModal.onConfirm?.(); setConfirmModal(null); }}
                 className="fp-btn"
                 style={{ ...btnGhost, background: C.accent, color: C.bg, borderColor: C.accent }}>
-                Confirm
+                {confirmModal.confirmLabel || "Confirm"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {staleConflict && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 200,
+          background: "rgba(0,0,0,0.65)", backdropFilter: "blur(2px)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{
+            background: C.panel, border: `1px solid ${C.danger}`, padding: 24,
+            maxWidth: 480, boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+          }}>
+            <div className="serif" style={{ fontSize: 18, fontStyle: "italic", marginBottom: 12, color: C.danger }}>Save conflict</div>
+            <div style={{ fontSize: 13, color: C.textDim, marginBottom: 16, lineHeight: 1.5 }}>
+              The following scenario{staleConflict.conflicts.length === 1 ? " was" : "s were"} edited on another device or browser tab:{" "}
+              <strong style={{ color: C.text }}>{staleConflict.conflicts.join(", ")}</strong>.
+              Your local changes haven't been saved. Choose how to proceed:
+            </div>
+            <div style={{ fontSize: 11, color: C.textMute, marginBottom: 20, lineHeight: 1.5 }}>
+              <strong>Refresh:</strong> reload the latest version from cloud — local changes will be lost.<br />
+              <strong>Download:</strong> save your current state to a file first, then refresh.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                onClick={() => {
+                  // Download current state, then leave the modal up so user can refresh next
+                  downloadJson({ scenarios, active: activeScenario }, "the-ledger-conflict-backup.json");
+                  setToast({ kind: "ok", msg: "Backup downloaded — now click Refresh to load latest" });
+                }}
+                className="fp-btn"
+                style={btnGhost}
+              >
+                Download backup
+              </button>
+              <button
+                onClick={() => {
+                  setStaleConflict(null);
+                  window.location.reload();
+                }}
+                className="fp-btn"
+                style={{ ...btnGhost, background: C.danger, color: C.bg, borderColor: C.danger }}
+              >
+                Refresh
               </button>
             </div>
           </div>
@@ -3421,8 +3707,8 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
               Offset accounts don't earn growth or income. Their benefit is reducing loan interest. Link this asset to a loan via the loan's "Offset from" field.
             </div>
           )}
-          {/* Franking — for equities/sharePlan with yield, OR other assets with positive flat income */}
-          {!isOffset && ((a.category === "equities") ? (a.dividendYield ?? 0) > 0 : (a.income > 0 && a.category !== "property" && a.category !== "super")) && (
+          {/* Franking — for equities (yield-based) only. Not shown for property/cash/super where franking doesn't apply. */}
+          {!isOffset && a.category === "equities" && (a.dividendYield ?? 0) > 0 && (
             <>
               <MiniField label="Fully franked?">
                 <select value={(a.frankedRate ?? 0) === 100 ? "yes" : (a.frankedRate ?? 0) === 0 ? "no" : "partial"} onChange={ev => {
