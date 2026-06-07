@@ -127,7 +127,7 @@ const DEFAULT_STATE = {
 
 // ---------- Storage ----------
 const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.13";
+const VERSION = "v1.14";
 
 
 // =================================================================
