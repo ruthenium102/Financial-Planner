@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { AreaChart, Area, ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
-import { Plus, Trash2, TrendingUp, Settings, Download, Upload, RotateCcw, Edit2, X, Home, DollarSign, PiggyBank, Layers, GraduationCap, User, LogOut, Cloud, CloudOff } from "lucide-react";
+import { Plus, Trash2, TrendingUp, Settings, Download, Upload, RotateCcw, X, Home, DollarSign, PiggyBank, Layers, GraduationCap, User, LogOut, Cloud, CloudOff } from "lucide-react";
 import { createClient } from "@supabase/supabase-js";
 
 // Supabase client. Reads URL + publishable key from Vite env vars at build time.
@@ -1423,6 +1423,8 @@ function DragHandle({ onMouseDown }) {
     <div
       onMouseDown={onMouseDown}
       title="Drag to reorder"
+      role="button"
+      aria-label="Drag to reorder"
       style={{
         cursor: "grab",
         color: C.textMute,
@@ -2266,7 +2268,7 @@ export default function FinancialPlanner() {
               {fileSyncStatus === "saved" && !fileDirty && <><Download size={11} color={C.good} /> Saved to {fileName}</>}
               {fileDirty && <><Download size={11} color={C.danger} /> Unsaved · {fileName}</>}
               {fileSyncStatus === "error" && <><Download size={11} color={C.danger} /> Save failed · {fileName}</>}
-              <button onClick={handleCloseFile} className="fp-btn" style={{ ...btnGhost, padding: "2px 6px", fontSize: 9, marginLeft: 4 }} title="Close file and return to cloud autosave">
+              <button onClick={handleCloseFile} className="fp-btn" style={{ ...btnGhost, padding: "2px 6px", fontSize: 9, marginLeft: 4 }} title="Close file and return to cloud autosave" aria-label="Close file and return to cloud autosave">
                 <X size={9} />
               </button>
             </div>
@@ -2358,7 +2360,7 @@ export default function FinancialPlanner() {
               >{name}</button>
             )}
             {Object.keys(scenarios).length > 1 && renamingScenario !== name && (
-              <button onClick={() => deleteScenario(name)} style={{ background: "transparent", border: "none", color: C.textMute, cursor: "pointer", padding: 4, opacity: 0.4 }}>
+              <button onClick={() => deleteScenario(name)} title={`Delete scenario "${name}"`} aria-label={`Delete scenario "${name}"`} style={{ background: "transparent", border: "none", color: C.textMute, cursor: "pointer", padding: 4, opacity: 0.4 }}>
                 <X size={12} />
               </button>
             )}
@@ -2911,7 +2913,7 @@ function Section({ title, subtitle, onAdd, bordered, children }) {
           <div className="serif" style={{ fontSize: 18, fontStyle: "italic", fontWeight: 500 }}>{title}</div>
           {subtitle && <div style={{ color: C.textMute, fontSize: 10, marginTop: 2, letterSpacing: "0.05em" }}>{subtitle}</div>}
         </div>
-        <button onClick={onAdd} className="fp-btn" style={btnGhostSm}><Plus size={12} /></button>
+        <button onClick={onAdd} className="fp-btn" style={btnGhostSm} title={`Add ${title}`} aria-label={`Add ${title}`}><Plus size={12} /></button>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>{children}</div>
     </div>
@@ -3331,7 +3333,7 @@ function EventRow({ ev, maxYear, currentAge, earners, editing, onEdit, onChange,
             </div>
           )}
         </div>
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostSm, color: C.danger }}><Trash2 size={11} /></button>
+        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostSm, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={11} /></button>
       </div>
     </div>
   );
@@ -3403,7 +3405,7 @@ function EarnerRow({ e, currentRow, equityAssets = [], editing, onEdit, onChange
             {isSG && " · no super (SG)"}
           </div>
         </div>
-        {canRemove && <button onClick={(ev) => { ev.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }}><Trash2 size={10} /></button>}
+        {canRemove && <button onClick={(ev) => { ev.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={10} /></button>}
       </div>
       {editing && (
         <div className="fade-in" onClick={(e) => e.stopPropagation()} style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
@@ -3560,7 +3562,7 @@ function KidRow({ k, editing, onEdit, onChange, onRemove }) {
             {k.yearsRemaining > 0 ? `${k.yearsRemaining} years remaining` : "Finished school"} · {k.feeGrowth}% indexation
           </div>
         </div>
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }}><Trash2 size={10} /></button>
+        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={10} /></button>
       </div>
       {editing && (
         <div className="fade-in" onClick={(e) => e.stopPropagation()} style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
@@ -3599,7 +3601,7 @@ function ExpenseRow({ x, maxYear, currentAge, editing, onEdit, onChange, onRemov
             {x.growth}% growth · {windowLabel}
           </div>
         </div>
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }}><Trash2 size={10} /></button>
+        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={10} /></button>
       </div>
       {editing && (
         <div className="fade-in" onClick={(e) => e.stopPropagation()} style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
@@ -3680,7 +3682,7 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
             </div>
           )}
         </div>
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }}><Trash2 size={10} /></button>
+        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={10} /></button>
       </div>
       {editing && (
         <div className="fade-in" onClick={(e) => e.stopPropagation()} style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
@@ -3837,7 +3839,7 @@ function LiabRow({ l, earners = [], offsetAssets = [], editing, onEdit, onChange
             {l.rate}% {type === "io" ? `IO ${l.ioPeriod ?? 5}y → P&I ${(l.termYears || 30) - (l.ioPeriod ?? 5)}y` : `P&I ${l.termYears || 30}y`} · {fmt(loanAnnual)}/yr payment{l.isInvestment ? " · investment" : ""}
           </div>
         </div>
-        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }}><Trash2 size={10} /></button>
+        <button onClick={(e) => { e.stopPropagation(); onRemove(); }} className="fp-btn" style={{ ...btnGhostXs, color: C.danger }} title="Remove" aria-label="Remove"><Trash2 size={10} /></button>
       </div>
       {editing && (
         <div className="fade-in" onClick={(e) => e.stopPropagation()} style={{ marginTop: 12, display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
