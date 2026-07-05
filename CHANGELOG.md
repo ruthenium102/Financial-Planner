@@ -4,6 +4,23 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.16 — 5 July 2026
+
+**Scenario deletion now asks for confirmation.** Deleting a scenario is permanent (it
+removes the cloud row too), but a single click on the × used to do it instantly. It now
+shows a confirmation modal with a red Delete button and a toast on completion.
+
+**Phone-friendly layout.** Below 900px the planner stacks the chart above the input
+panels instead of crushing them into a 400px column — the iOS app and phone browsers
+get the full width for editing.
+
+**Component split.** The UI is now organised into modules: `theme.js` (design tokens,
+formatters, shared styles) and `src/components/` (rows, fields, tooltips, Logic tab,
+Trace tab, auth screen). `App.jsx` shrank from ~3,500 to ~1,500 lines and only holds
+the main component. No behaviour change.
+
+---
+
 ## v1.15 — 5 July 2026
 
 ### Tax fixes

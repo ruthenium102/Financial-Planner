@@ -131,10 +131,12 @@ If clearing browser data, use **Save As** first to back up. With Supabase config
 ```
 financial-planner-pkg/
 ├── src/
-│   ├── App.jsx          # UI — components, charts, state management
+│   ├── App.jsx          # Main component — charts, state management, layout
 │   ├── engine.js        # Pure projection engine — tax, super, loans, migration (no React)
 │   ├── engine.test.js   # Engine regression tests (Vitest)
 │   ├── storage.js       # Persistence — Supabase, localStorage, file save/load
+│   ├── theme.js         # Design tokens, category metadata, formatters, shared styles
+│   ├── components/      # Row editors, fields, tooltips, Logic/Trace tabs, auth screen
 │   ├── ErrorBoundary.jsx# Top-level error boundary
 │   └── main.jsx         # React entry point
 ├── index.html           # HTML shell with fonts
