@@ -2,7 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="The Ledger" />
+    <meta name="theme-color" content="#0f0d0a" />
+    <meta name="format-detection" content="telephone=no" />
     <title>The Ledger — Financial Planner</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -11,8 +19,22 @@
       rel="stylesheet"
     />
     <style>
-      body, html, #root { margin: 0; padding: 0; height: 100%; background: #0f0d0a; }
-      body { font-family: 'Inter Tight', system-ui, sans-serif; color: #DCD7C8; }
+      html, body, #root { margin: 0; padding: 0; min-height: 100%; background: #0f0d0a; }
+      body {
+        font-family: 'Inter Tight', system-ui, sans-serif;
+        color: #DCD7C8;
+        -webkit-text-size-adjust: 100%;
+        -webkit-tap-highlight-color: transparent;
+        overscroll-behavior-y: none;
+      }
+      #root {
+        padding-top: env(safe-area-inset-top);
+        padding-right: env(safe-area-inset-right);
+        padding-bottom: env(safe-area-inset-bottom);
+        padding-left: env(safe-area-inset-left);
+        box-sizing: border-box;
+      }
+      input, textarea, select, button { font-size: 16px; }
       .serif { font-family: 'EB Garamond', Georgia, serif; }
       .mono { font-family: 'JetBrains Mono', monospace; }
     </style>

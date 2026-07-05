@@ -4,6 +4,60 @@ All notable changes to The Ledger are recorded here. Each entry corresponds to a
 
 ---
 
+## v1.15 — 5 July 2026
+
+### Tax fixes
+
+**Medicare Levy Surcharge was one tier too low** — the tier table was off by one band, so
+anyone modelled without private health cover paid 0% instead of 1% in tier 1, 1% instead of
+1.25% in tier 2, and the top 1.5% rate was unreachable. Now matches ATO 2025–26 thresholds
+exactly (covered by unit tests).
+
+**Medicare levy low-income phase-in** — the 2% levy previously kicked in as a cliff at
+$27,222. It now shades in at 10c per dollar of the excess, matching the ATO calculation.
+
+**Division 293 no longer double-counts salary sacrifice** — Div-293 income is now computed
+as taxable income (+ investment-loss add-back) + concessional contributions, instead of
+gross + concessional. Salary-sacrificing near the $250k threshold no longer triggers
+Div 293 early.
+
+### Retirement drawdown (new)
+
+Cash shortfalls (typically after retirement) are now funded by selling assets instead of
+letting cash go infinitely negative: other cash accounts first, then shares, then super once
+the household reaches the super access age (default 60). Configurable under Assumptions
+(including off, which restores the old behaviour). Negative cash balances also no longer
+compound at the cash growth rate. The wealth-chart tooltip shows how each year's deficit
+was funded, and flags any unfunded shortfall.
+
+### Cloud sync fixes
+
+- **Renaming a scenario no longer duplicates it in the cloud.** Previously the rename
+  inserted a new row and orphaned the old one, which resurrected the old name on next sign-in.
+- Loading scenarios no longer immediately re-saves them (every load used to bump every
+  row's version for nothing, inviting conflicts from other open tabs).
+- Signing out clears the localStorage cache so financial data doesn't linger on shared machines.
+- Scenario rows now save in parallel instead of one at a time.
+
+### Load dialog
+
+Loading a file when scenarios already exist now offers three real choices: **Replace all**,
+**Merge in**, and **Cancel**. (Previously "Cancel"/Escape silently merged.)
+
+### Under the hood
+
+- `App.jsx` split into `engine.js` (pure projection/tax engine), `storage.js`
+  (Supabase / localStorage / file persistence), and the UI.
+- **Unit tests** (Vitest, `npm test`): ATO brackets, Medicare levy + MLS, IRAS brackets,
+  Div 293, loan amortisation, scenario migration, drawdown, franking credits.
+- Item IDs use `crypto.randomUUID` (no more same-millisecond collisions).
+- README setup SQL now includes the `version` column (new installs were broken without it).
+- App version derives from `package.json` so the two can't drift.
+- Accessibility: pinch-zoom no longer blocked; auth-screen links are real buttons.
+- Removed duplicate font loading and dead code; ESLint unused-variable warnings fixed.
+
+---
+
 ## v1.13 — 6 May 2026
 
 ### ⚠️ Required action: Supabase migration

@@ -1,52 +1,20 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { AreaChart, Area, ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from "recharts";
 import { Plus, Trash2, TrendingUp, Settings, Download, Upload, RotateCcw, X, Home, DollarSign, PiggyBank, Layers, GraduationCap, User, LogOut, Cloud, CloudOff } from "lucide-react";
-import { createClient } from "@supabase/supabase-js";
+import pkg from "../package.json";
+import {
+  DEFAULT_STATE, migrateScenario, project, computeAnnualPayment, genId,
+  CONCESSIONAL_CAP, NONCONCESSIONAL_CAP, DIV293_THRESHOLD,
+} from "./engine.js";
+import {
+  SUPABASE_ENABLED, supabase, canAutosaveToFile, downloadJson, writeJsonToFileHandle,
+  loadFromLocalStorage, saveToLocalStorage, clearLocalStorage,
+  loadFromSupabase, saveToSupabase, deleteFromSupabase,
+} from "./storage.js";
 
-// Supabase client. Reads URL + publishable key from Vite env vars at build time.
-// In dev: edit .env.local. In Vercel production: set these as Environment Variables.
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_KEY;
-const SUPABASE_ENABLED = !!(SUPABASE_URL && SUPABASE_KEY);
-
-// ===== File workflow helpers =====
-// File System Access API support detection (Chrome/Edge/Brave on desktop = yes; Safari/Firefox = no)
-function canAutosaveToFile() {
-  return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function";
-}
-
-// Strip internal fields like _supabaseId and _version from each scenario before serialising to file.
-function stripInternalFields(scenarios) {
-  const clean = {};
-  for (const [name, scen] of Object.entries(scenarios || {})) {
-    const { _supabaseId, _version, ...rest } = scen || {};
-    clean[name] = rest;
-  }
-  return clean;
-}
-
-// Write scenarios to a FileSystemFileHandle (Chrome/Edge silent autosave path)
-async function writeJsonToFileHandle(handle, payload) {
-  const cleanPayload = { ...payload, scenarios: stripInternalFields(payload.scenarios) };
-  const writable = await handle.createWritable();
-  await writable.write(JSON.stringify(cleanPayload, null, 2));
-  await writable.close();
-}
-
-// Trigger a download of the given JSON payload (Safari/Firefox manual-save path)
-function downloadJson(payload, filename) {
-  const cleanPayload = { ...payload, scenarios: stripInternalFields(payload.scenarios) };
-  const blob = new Blob([JSON.stringify(cleanPayload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename || "the-ledger.json";
-  a.style.display = "none";
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
-}
-const supabase = SUPABASE_ENABLED ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+// App version, derived from package.json so the two can't drift.
+// Bump the package.json "version" field on every release.
+const VERSION = "v" + pkg.version.split(".").slice(0, 2).join(".");
 
 // ---------- Design tokens ----------
 const C = {
@@ -105,1230 +73,6 @@ const CASHFLOW_EXPENSE = [
   { key: "cf_eventExpense",  label: "Event expense",    color: "#D9967F" },
 ];
 
-// ---------- Defaults ----------
-const DEFAULT_STATE = {
-  meta: { currentAge: 40, horizonYears: 30, inflation: 2.5, currency: "AUD", fxSgdAud: 1.10, retirementSpendingMultiplier: 0.75 },
-  assets: [
-    { id: "a1", name: "Cash & savings", category: "cash", value: 0, growth: 4.0, income: 0 },
-  ],
-  liabilities: [],
-  earners: [
-    { id: "e1", name: "Earner 1", currency: "AUD",
-      salary: 0, bonusRateCash: 0, bonusRateShares: 0, salaryGrowth: 3.0,
-      taxMode: "ato", taxRate: 32, hasPrivateHealth: true,
-      superSgRate: 12.0, superSgIncludesBonus: false,
-      superExtraConcessionalRate: 0, superExtraNonConcessionalRate: 0,
-      superMatchConcessionalRate: 0, superMatchNonConcessionalRate: 0 },
-  ],
-  expenses: [],
-  kids: [],
-  events: [],
-};
-
-// ---------- Storage ----------
-const STORAGE_KEY = "fp:scenarios:v14";
-const VERSION = "v1.14";
-
-
-// =================================================================
-// Storage layer — Supabase when authenticated, localStorage as fallback
-// =================================================================
-//
-// The app keeps a small wrapper { scenarios: { [name]: scenarioObj }, active: string }.
-// In Supabase each scenario is a row keyed by id with name + data (jsonb). We collapse
-// the rows into the wrapper format for the React state.
-//
-// Local fallback (localStorage) is used when Supabase is disabled OR a user is logged out.
-// On first sign-in, if Supabase has no rows but localStorage does, we migrate it up.
-
-async function loadFromLocalStorage() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch (e) {}
-  return null;
-}
-async function saveToLocalStorage(data) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch (e) {}
-}
-
-async function loadFromSupabase(userId) {
-  if (!supabase || !userId) return null;
-  const { data: rows, error } = await supabase
-    .from("scenarios")
-    .select("id, name, data, version")
-    .eq("user_id", userId);
-  if (error) {
-    console.error("Supabase load error:", error);
-    return null;
-  }
-  if (!rows || rows.length === 0) return null;
-  const scenarios = {};
-  rows.forEach(r => { scenarios[r.name] = { ...r.data, _supabaseId: r.id, _version: r.version || 0 }; });
-  // Pick first scenario alphabetically as active by default; useEffect will preserve user's choice
-  const active = Object.keys(scenarios).sort()[0];
-  return { scenarios, active };
-}
-
-// Save the entire wrapper to Supabase using per-row updates with optimistic concurrency.
-// For each existing row (has _supabaseId): UPDATE WHERE id = ? AND version = ?
-// If matched: row updated, returns new version.
-// If not matched: stale write detected — returns { stale: true, conflicts: [scenarioName, ...] }
-// New rows (no _supabaseId): plain insert.
-async function saveToSupabase(userId, data) {
-  if (!supabase || !userId || !data?.scenarios) return { ok: false };
-  const entries = Object.entries(data.scenarios);
-  const idByName = {};
-  const versionByName = {};
-  const conflicts = [];
-
-  for (const [name, scenObj] of entries) {
-    const { _supabaseId, _version, ...payload } = scenObj;
-    if (_supabaseId) {
-      // Existing row — optimistic concurrency update
-      const expectedVersion = _version || 0;
-      const { data: updated, error } = await supabase
-        .from("scenarios")
-        .update({ name, data: payload, version: expectedVersion + 1 })
-        .eq("id", _supabaseId)
-        .eq("version", expectedVersion)
-        .select("id, name, version");
-      if (error) {
-        console.error("Supabase update error:", error);
-        return { ok: false, error };
-      }
-      if (!updated || updated.length === 0) {
-        // Row exists but version didn't match — stale write
-        conflicts.push(name);
-      } else {
-        idByName[name] = updated[0].id;
-        versionByName[name] = updated[0].version;
-      }
-    } else {
-      // New row — insert
-      const { data: inserted, error } = await supabase
-        .from("scenarios")
-        .insert({ user_id: userId, name, data: payload, version: 1 })
-        .select("id, name, version");
-      if (error) {
-        console.error("Supabase insert error:", error);
-        return { ok: false, error };
-      }
-      if (inserted && inserted[0]) {
-        idByName[name] = inserted[0].id;
-        versionByName[name] = inserted[0].version;
-      }
-    }
-  }
-  if (conflicts.length > 0) {
-    return { ok: false, stale: true, conflicts, idByName, versionByName };
-  }
-  return { ok: true, idByName, versionByName };
-}
-
-// Delete a scenario row from Supabase by id
-async function deleteFromSupabase(supabaseId) {
-  if (!supabase || !supabaseId) return;
-  const { error } = await supabase.from("scenarios").delete().eq("id", supabaseId);
-  if (error) console.error("Supabase delete error:", error);
-}
-
-// Migrate a scenario to ensure all expected fields exist (guards against old saves
-// and handcrafted imports). Keeps any values already present.
-function migrateScenario(s) {
-  if (!s || typeof s !== "object") return null;
-  const out = {
-    meta: { fxSgdAud: 1.15, retirementSpendingMultiplier: 0.75, ...(s.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" }) },
-    assets: Array.isArray(s.assets) ? s.assets.map(a => {
-      const aOut = { runningExpenses: 0, earnerId: null, frankedRate: (a.category === "equities") ? 100 : 0, ...a };
-      // ===== Category migration =====
-      // Legacy "sharePlan" → "equities" (consolidated as "Shares")
-      if (aOut.category === "sharePlan") aOut.category = "equities";
-      // Legacy "property" → "investmentProperty" if any loan was flagged investment, else "primaryResidence"
-      if (aOut.category === "property") {
-        const anyInvestment = (a.loans || []).some(l => l.isInvestment) || a.loan?.isInvestment;
-        aOut.category = anyInvestment ? "investmentProperty" : "primaryResidence";
-      }
-      // Convert flat income → dividendYield for equities (yield-based)
-      if (aOut.category === "equities" && aOut.dividendYield == null) {
-        if (aOut.income > 0 && aOut.value > 0) {
-          aOut.dividendYield = (aOut.income / aOut.value) * 100;
-        } else {
-          aOut.dividendYield = 4;
-        }
-        aOut.income = 0;
-      }
-      // Joint ownership migration
-      if (!aOut.ownershipShares) {
-        if (aOut.earnerId) {
-          aOut.ownershipShares = { [aOut.earnerId]: 100 };
-        } else {
-          aOut.ownershipShares = {};
-        }
-      }
-      // Normalise loan(s): support legacy a.loan (single object) → a.loans (array)
-      let loans = Array.isArray(a.loans) ? a.loans.slice() : [];
-      if (a.loan) loans.push(a.loan);
-      // For investment property: force isInvestment = true on all loans (category drives it)
-      // For primary residence: force isInvestment = false
-      const isIP = aOut.category === "investmentProperty";
-      const isPR = aOut.category === "primaryResidence";
-      loans = loans.map(loan => {
-        const ln = { isInvestment: false, offsetCashAssetId: null, earnerId: null, ...loan };
-        if (isIP) ln.isInvestment = true;
-        else if (isPR) ln.isInvestment = false;
-        if (!ln.type) {
-          if (ln.annualPayment != null) {
-            const io = (ln.balance || 0) * ((ln.rate || 0) / 100);
-            ln.type = (io > 0 && Math.abs(ln.annualPayment - io) / io < 0.1) ? "io" : "pi";
-          } else {
-            ln.type = "pi";
-          }
-        }
-        if (!ln.termYears) ln.termYears = 30;
-        if (ln.type === "io" && ln.ioPeriod == null) {
-          ln.ioPeriod = ln.termYears;
-          if (ln.termYears < 30) ln.termYears = 30;
-        }
-        if (ln.type === "pi" && ln.ioPeriod == null) ln.ioPeriod = 0;
-        if (ln.originalBalance == null) ln.originalBalance = ln.balance;
-        if (!ln.id) ln.id = `ln${Date.now()}${Math.random().toString(36).slice(2, 6)}`;
-        delete ln.annualPayment;
-        return ln;
-      });
-      aOut.loans = loans;
-      delete aOut.loan;
-      return aOut;
-    }) : [],
-    liabilities: Array.isArray(s.liabilities) ? s.liabilities.map(l => {
-      const out = { isInvestment: false, offsetCashAssetId: null, earnerId: null, ...l };
-      if (!out.type) {
-        if (out.annualPayment != null) {
-          const io = (out.balance || 0) * ((out.rate || 0) / 100);
-          out.type = (io > 0 && Math.abs(out.annualPayment - io) / io < 0.1) ? "io" : "pi";
-        } else {
-          out.type = "pi";
-        }
-      }
-      if (!out.termYears) out.termYears = 30;
-      if (out.type === "io" && out.ioPeriod == null) {
-        out.ioPeriod = out.termYears;
-        if (out.termYears < 30) out.termYears = 30;
-      }
-      if (out.type === "pi" && out.ioPeriod == null) out.ioPeriod = 0;
-      if (out.originalBalance == null) out.originalBalance = out.balance;
-      delete out.annualPayment;
-      return out;
-    }) : [],
-    earners: Array.isArray(s.earners) ? s.earners.map(e => {
-      const out = {
-        taxMode: "ato", currency: "AUD",
-        bonusRateCash: 0, bonusRateShares: 0,
-        hasPrivateHealth: true,
-        superSgRate: 12.0, superSgIncludesBonus: false,
-        superExtraConcessionalRate: 0, superExtraNonConcessionalRate: 0,
-        superMatchConcessionalRate: 0, superMatchNonConcessionalRate: 0,
-        ...e
-      };
-      // Legacy: superContribRate → superSgRate
-      if (e.superContribRate != null && e.superSgRate == null) {
-        out.superSgRate = e.superContribRate;
-      }
-      // Legacy: bonusRate → bonusRateCash (single bonus assumed cash)
-      if (e.bonusRate != null && e.bonusRateCash == null) {
-        out.bonusRateCash = e.bonusRate;
-      }
-      // Legacy: superMatchRate + superMatchType → split fields
-      if (e.superMatchRate != null && e.superMatchConcessionalRate == null && e.superMatchNonConcessionalRate == null) {
-        if ((e.superMatchType || "concessional") === "concessional") {
-          out.superMatchConcessionalRate = e.superMatchRate;
-        } else {
-          out.superMatchNonConcessionalRate = e.superMatchRate;
-        }
-      }
-      delete out.superContribRate;
-      delete out.bonusRate;
-      delete out.superMatchRate;
-      delete out.superMatchType;
-      return out;
-    }) : [],
-    kids: Array.isArray(s.kids) ? s.kids : [],
-    // Upgrade legacy cashflow.livingExpenses to expense items list
-    expenses: Array.isArray(s.expenses) ? s.expenses
-      : (s.cashflow ? [{
-          id: "legacy",
-          name: "Living expenses",
-          amount: s.cashflow.livingExpenses || 0,
-          growth: s.cashflow.expenseGrowth || 2.5,
-          startYear: 0, endYear: null,
-        }] : []),
-    events: Array.isArray(s.events) ? s.events.map(ev => ({
-      // Asset-sale fields are no-ops for non-sale events
-      costBase: 0, heldOverYear: true, ownerId: null,
-      ...ev,
-    })) : [],
-  };
-
-  // Post-process: merge any "offset" or cash assets that were linked to a loan onto the loan
-  // itself as `loan.offsetBalance`. Then remove the standalone asset. The offset balance now
-  // lives on the loan and shows in the wealth chart via projection rows (under the "cash" stack).
-  const offsetAssetIds = new Set();
-  const balanceByOffsetId = {};
-  out.assets.forEach(a => {
-    if (a.category === "offset") balanceByOffsetId[a.id] = a.value || 0;
-  });
-
-  // Walk all loans (in assets and liabilities), copy balance and mark the asset for removal
-  const moveBalanceOntoLoan = (loan) => {
-    const linkedId = loan.offsetCashAssetId;
-    if (!linkedId) return loan;
-    if (loan.offsetBalance == null) {
-      // Use the linked asset's value if it exists; else 0
-      loan.offsetBalance = balanceByOffsetId[linkedId] ?? 0;
-    }
-    offsetAssetIds.add(linkedId);
-    return { ...loan, offsetBalance: loan.offsetBalance, offsetCashAssetId: null };
-  };
-  out.assets = out.assets.map(a => ({
-    ...a,
-    loans: (a.loans || []).map(moveBalanceOntoLoan),
-  }));
-  out.liabilities = out.liabilities.map(l => moveBalanceOntoLoan(l));
-  // Remove the now-orphaned standalone offset assets
-  if (offsetAssetIds.size > 0) {
-    out.assets = out.assets.filter(a => !offsetAssetIds.has(a.id));
-  }
-  // Default offsetBalance to 0 on any loan that doesn't have one set
-  out.assets = out.assets.map(a => ({
-    ...a,
-    loans: (a.loans || []).map(l => ({ ...l, offsetBalance: l.offsetBalance ?? 0 })),
-  }));
-  out.liabilities = out.liabilities.map(l => ({ ...l, offsetBalance: l.offsetBalance ?? 0 }));
-
-  // Cash optimisation defaults
-  if (!out.meta.cashOptimisation) {
-    out.meta.cashOptimisation = {
-      enabled: false,                // off by default
-      mode: "off",                   // "off" | "offset" | "equities"
-      minBuffer: 50000,              // user-editable $ floor
-      sweepSourceAssetId: null,      // designated cash asset to sweep from
-      sweepTargetOffsetLoanKey: null, // designated loan whose offset receives the sweep
-      sweepTargetEquityAssetId: null, // designated equity asset for spillover or pure-equities sweep
-    };
-  }
-
-  return out;
-}
-
-// ---------- ATO tax (resident individual, 2025-26 FY) ----------
-// Brackets unchanged from 2024-25; same rates apply to 2025-26
-// Source: ATO, verified Apr 2026
-const ATO_BRACKETS_2025_26 = [
-  { upTo: 18200,  rate: 0.00, base: 0 },
-  { upTo: 45000,  rate: 0.16, base: 0 },
-  { upTo: 135000, rate: 0.30, base: 4288 },      // 16% of (45000-18200)
-  { upTo: 190000, rate: 0.37, base: 31288 },     // 4288 + 30% of (135000-45000)
-  { upTo: Infinity, rate: 0.45, base: 51638 },   // 31288 + 37% of (190000-135000)
-];
-const MEDICARE_LEVY_RATE = 0.02;
-
-// Medicare Levy Surcharge (2025-26 thresholds) — applies if no private hospital cover.
-// Tier 1: 1.0% on income above $101,000 (single) / $202,000 (family)
-// Tier 2: 1.25% above $118,000 / $236,000
-// Tier 3: 1.5% above $158,000 / $316,000
-// Family threshold is increased by $1,500 for EACH dependent child after the first.
-// Source: ATO, verified May 2026 — https://www.ato.gov.au/individuals-and-families/medicare-and-private-health-insurance/medicare-levy-surcharge/medicare-levy-surcharge-income-thresholds-and-rates
-const MLS_TIERS = {
-  single: [
-    { threshold: 101000, rate: 0.000 },
-    { threshold: 118001, rate: 0.010 },
-    { threshold: 158001, rate: 0.0125 },
-    { threshold: Infinity, rate: 0.015 },
-  ],
-  family: [
-    { threshold: 202000, rate: 0.000 },
-    { threshold: 236001, rate: 0.010 },
-    { threshold: 316001, rate: 0.0125 },
-    { threshold: Infinity, rate: 0.015 },
-  ],
-};
-const MLS_KID_UPLIFT = 1500;  // +$1,500 per kid AFTER the first
-function medicareLevySurcharge(income, isFamily = false, dependentKids = 0) {
-  // Returns the MLS rate that applies at this income level
-  const tiers = isFamily ? MLS_TIERS.family : MLS_TIERS.single;
-  const uplift = isFamily && dependentKids > 1 ? (dependentKids - 1) * MLS_KID_UPLIFT : 0;
-  let rate = 0;
-  for (const t of tiers) {
-    if (income < (t.threshold + uplift)) break;
-    rate = t.rate;
-  }
-  return income * rate;
-}
-
-function atoIncomeTax(taxableIncome) {
-  if (taxableIncome <= 0) return 0;
-  for (const b of ATO_BRACKETS_2025_26) {
-    if (taxableIncome <= b.upTo) {
-      const prevUpTo = ATO_BRACKETS_2025_26[ATO_BRACKETS_2025_26.indexOf(b) - 1]?.upTo ?? 0;
-      return b.base + (taxableIncome - prevUpTo) * b.rate;
-    }
-  }
-  return 0;
-}
-
-// ATO total tax = income tax + Medicare Levy + (optional) Medicare Levy Surcharge.
-// `hasPrivateHealth` (default true) suppresses MLS. `householdMlsIncome` is the household's
-// MLS-purposes income (taxable + reportable super contribs + net investment losses + reportable FBT),
-// used as the basis for MLS family threshold checks. `dependentKids` is the count of kids still in
-// dependant period, used for the +$1,500-per-additional-kid family threshold uplift.
-// `mlsIncome` is the individual's own MLS-purposes income (used as the *amount* MLS is applied to).
-function atoTotalTax(taxableIncome, hasPrivateHealth = true, householdMlsIncome = undefined, dependentKids = 0, mlsIncome = undefined) {
-  if (taxableIncome <= 0) return 0;
-  let tax = atoIncomeTax(taxableIncome);
-  if (taxableIncome > 27222) tax += taxableIncome * MEDICARE_LEVY_RATE;
-  if (!hasPrivateHealth) {
-    const isFamily = householdMlsIncome != null && householdMlsIncome > (mlsIncome ?? taxableIncome);
-    const incomeForMlsCheck = householdMlsIncome ?? mlsIncome ?? taxableIncome;
-    const tiers = isFamily ? MLS_TIERS.family : MLS_TIERS.single;
-    const uplift = isFamily && dependentKids > 1 ? (dependentKids - 1) * MLS_KID_UPLIFT : 0;
-    let rate = 0;
-    for (const t of tiers) { if (incomeForMlsCheck < (t.threshold + uplift)) break; rate = t.rate; }
-    // MLS is applied to the individual's MLS income (or fall back to taxable income)
-    tax += (mlsIncome ?? taxableIncome) * rate;
-  }
-  return tax;
-}
-
-// ---------- Singapore tax (resident individual, YA2026 / income year 2025) ----------
-// Rates current as at YA2026; same rates apply going forward unless changed.
-// Source: IRAS, verified Apr 2026
-const SG_BRACKETS = [
-  { upTo: 20000,   rate: 0.00,  base: 0 },
-  { upTo: 30000,   rate: 0.02,  base: 0 },
-  { upTo: 40000,   rate: 0.035, base: 200 },
-  { upTo: 80000,   rate: 0.07,  base: 550 },
-  { upTo: 120000,  rate: 0.115, base: 3350 },
-  { upTo: 160000,  rate: 0.15,  base: 7950 },
-  { upTo: 200000,  rate: 0.18,  base: 13950 },
-  { upTo: 240000,  rate: 0.19,  base: 21150 },
-  { upTo: 280000,  rate: 0.195, base: 28750 },
-  { upTo: 320000,  rate: 0.20,  base: 36550 },
-  { upTo: 500000,  rate: 0.22,  base: 44550 },
-  { upTo: 1000000, rate: 0.23,  base: 84150 },
-  { upTo: Infinity,rate: 0.24,  base: 199150 },
-];
-
-function sgIncomeTax(taxableIncome) {
-  if (taxableIncome <= 0) return 0;
-  for (let i = 0; i < SG_BRACKETS.length; i++) {
-    const b = SG_BRACKETS[i];
-    if (taxableIncome <= b.upTo) {
-      const prev = i > 0 ? SG_BRACKETS[i - 1].upTo : 0;
-      return b.base + (taxableIncome - prev) * b.rate;
-    }
-  }
-  return 0;
-}
-
-// Compute tax for an earner based on their tax mode and currency context.
-// `gross` is the taxable income (already net of any salary sacrifice for ATO earners).
-// Returns tax in the EARNER'S currency (so for SG earners, returns SGD tax).
-// `householdMlsIncome` and `mlsIncome` are MLS-purposes income (add-backs included).
-// `dependentKids` is the number of kids still in dependant period (for family threshold uplift).
-function computeEarnerTax(earner, gross, householdMlsIncome = undefined, dependentKids = 0, mlsIncome = undefined) {
-  const mode = earner.taxMode || "ato";
-  if (mode === "flat") return gross * ((earner.taxRate || 0) / 100);
-  if (mode === "sg")   return sgIncomeTax(gross);
-  return atoTotalTax(gross, earner.hasPrivateHealth !== false, householdMlsIncome, dependentKids, mlsIncome);
-}
-
-// ---------- Super contribution caps (FY2025-26) ----------
-// Source: ATO, verified Apr 2026
-// FY2025-26: concessional $30k, non-concessional $120k
-// FY2026-27 onwards: concessional $32.5k, non-concessional $130k (legislated)
-// We use the current values as a flat assumption; users can override per scenario via meta.
-const CONCESSIONAL_CAP = 30000;
-const NONCONCESSIONAL_CAP = 120000;
-const SUPER_CONTRIB_TAX = 0.15;              // 15% tax on concessional contribs in fund
-const DIV293_THRESHOLD = 250000;              // income + concessional > this triggers extra 15%
-const DIV293_EXTRA_TAX = 0.15;
-
-// Compute annual loan payment given loan config and current balance.
-// - IO loans: during IO period, payment = balance * rate (interest only).
-//   After IO period ends, loan converts to P&I and amortises over the REMAINING term.
-//   computeAnnualPayment shows the IO-period payment (steady state); the engine handles
-//   the post-conversion amortisation year by year.
-// - P&I loans: standard amortisation — payment amortises the ORIGINAL balance over termYears.
-function computeAnnualPayment(loan) {
-  if (!loan) return 0;
-  const r = (loan.rate || 0) / 100;
-  const type = loan.type || "pi";
-  const balance = loan.balance || 0;
-  if (type === "io") {
-    return balance * r;
-  }
-  // P&I: amortise the original (or current if not set) over remaining term
-  const term = loan.termYears || 30;
-  const P = loan.originalBalance || balance;
-  if (r === 0) return P / term;
-  return P * r / (1 - Math.pow(1 + r, -term));
-}
-
-// ---------- Projection engine ----------
-// Property categories: "primaryResidence" and "investmentProperty" both behave as property,
-// but only investmentProperty generates rental income / negative gearing.
-function isPropertyCategory(cat) {
-  return cat === "primaryResidence" || cat === "investmentProperty" || cat === "property";
-}
-function isInvestmentProperty(asset) {
-  if (!asset) return false;
-  if (asset.category === "investmentProperty") return true;
-  // Legacy: a "property" with at least one investment loan
-  if (asset.category === "property") {
-    return (asset.loans || []).some(l => l.isInvestment);
-  }
-  return false;
-}
-
-function project(state) {
-  // Defensive: normalise missing arrays so old/corrupt scenarios don't crash
-  const meta = state.meta || { currentAge: 45, horizonYears: 45, inflation: 2.5, currency: "AUD" };
-  const assets = Array.isArray(state.assets) ? state.assets : [];
-  const liabilities = Array.isArray(state.liabilities) ? state.liabilities : [];
-  const earners = Array.isArray(state.earners) ? state.earners : [];
-  const kids = Array.isArray(state.kids) ? state.kids : [];
-  const events = Array.isArray(state.events) ? state.events : [];
-  // Support both old (cashflow.livingExpenses) and new (expenses[]) schemas gracefully
-  const expenseItems = Array.isArray(state.expenses) ? state.expenses : (state.cashflow ? [
-    { id: "legacy", name: "Living expenses", amount: state.cashflow.livingExpenses || 0, growth: state.cashflow.expenseGrowth || 2.5, startYear: 0, endYear: null }
-  ] : []);
-  const years = meta.horizonYears || 45;
-  const rows = [];
-
-  let balances = {};
-  assets.forEach(a => { balances[a.id] = a.value; });
-
-  // Combined liability tracking: asset-attached loans + standalone liabilities
-  let liabs = {};          // key → current balance
-  let offsetByLoan = {};   // key → current offset balance (lives on loan, mutated by amortisation/sweep)
-  let loanMeta = {};       // key → { type, rate, termYears, yearsElapsed, isInvestment, assetId, earnerId }
-  assets.forEach(a => {
-    const loans = Array.isArray(a.loans) ? a.loans : (a.loan ? [a.loan] : []);
-    loans.forEach(loan => {
-      if (!loan || loan.balance <= 0) return;
-      const key = `asset:${a.id}:${loan.id || "ln"}`;
-      liabs[key] = loan.balance;
-      offsetByLoan[key] = loan.offsetBalance || 0;
-      loanMeta[key] = {
-        type: loan.type || "pi",
-        rate: loan.rate || 0,
-        termYears: loan.termYears || 30,
-        ioPeriod: loan.ioPeriod || (loan.type === "io" ? (loan.termYears || 5) : 0),
-        originalBalance: loan.originalBalance || loan.balance,
-        yearsElapsed: 0,
-        isInvestment: !!loan.isInvestment,
-        assetId: a.id,
-        earnerId: loan.earnerId || a.earnerId || null,
-      };
-    });
-  });
-  liabilities.forEach(l => {
-    const key = `liab:${l.id}`;
-    liabs[key] = l.balance;
-    offsetByLoan[key] = l.offsetBalance || 0;
-    loanMeta[key] = {
-      type: l.type || "pi",
-      rate: l.rate || 0,
-      termYears: l.termYears || 30,
-      ioPeriod: l.ioPeriod || (l.type === "io" ? (l.termYears || 5) : 0),
-      originalBalance: l.originalBalance || l.balance,
-      yearsElapsed: 0,
-      isInvestment: !!l.isInvestment,
-      assetId: null,
-      earnerId: l.earnerId || null,
-    };
-  });
-
-  let earnerState = {};
-  earners.forEach(e => { earnerState[e.id] = { salary: e.salary, retired: false }; });
-
-  let kidState = {};
-  kids.forEach(k => { kidState[k.id] = { fees: k.annualFees, yearsRemaining: k.yearsRemaining }; });
-
-  // Per-expense running amount (compounded each year)
-  let expenseState = {};
-  expenseItems.forEach(x => { expenseState[x.id] = x.amount; });
-
-  const retirementByEarner = {};
-  events.filter(e => e.type === "retirement" && e.earnerId).forEach(e => {
-    retirementByEarner[e.earnerId] = e.yearOffset;
-  });
-
-  for (let y = 0; y <= years; y++) {
-    const age = meta.currentAge + y;
-
-    earners.forEach(e => {
-      const retYear = retirementByEarner[e.id];
-      if (retYear != null && y >= retYear) earnerState[e.id].retired = true;
-    });
-
-    // FX rate: how many AUD per 1 SGD. Default 1.15 if missing.
-    const fxSgdAud = (meta.fxSgdAud != null && meta.fxSgdAud > 0) ? meta.fxSgdAud : 1.15;
-
-    // Super caps (allow per-scenario override via meta; otherwise constants)
-    const concessionalCap = meta.concessionalCap || CONCESSIONAL_CAP;
-    const nonConcessionalCap = meta.nonConcessionalCap || NONCONCESSIONAL_CAP;
-
-    // ========== PROPERTY / INVESTMENT LOAN TAX ATTRIBUTION ==========
-    // For each loan, compute this year's interest using offset-aware effective balance.
-    // Interest on investment loans is tax-deductible to the linked earner.
-    // Rental income minus interest minus running expenses = net rental result (negative gearing if <0).
-    // Result is attributed to the loan's earner (or asset's earner) for income-tax adjustment.
-    const interestThisYear = {};        // loan key → interest paid this year (used for amortisation later)
-    const rentalAdjustmentByEarner = {}; // earnerId → net rental result this year (positive=income, negative=loss)
-    let totalRentalIncome = 0, totalRentalExpenses = 0, totalInvestmentInterest = 0;
-
-    // First pass: per-loan interest, accounting for offset
-    Object.keys(liabs).forEach(key => {
-      if (liabs[key] <= 0) { interestThisYear[key] = 0; return; }
-      const m = loanMeta[key];
-      if (!m) { interestThisYear[key] = 0; return; }
-      // If full term has elapsed, no interest
-      if (m.yearsElapsed >= m.termYears) { interestThisYear[key] = 0; return; }
-      // Offset: subtract loan's own offsetBalance from interest base (capped at loan balance)
-      const offsetAmount = Math.min(Math.max(0, offsetByLoan[key] || 0), liabs[key]);
-      const effectiveBalance = Math.max(0, liabs[key] - offsetAmount);
-      interestThisYear[key] = effectiveBalance * (m.rate / 100);
-    });
-
-    // Helper: distribute an amount across earners according to an asset's ownershipShares.
-    // Falls back to first AUD ATO earner if shares are empty/missing.
-    const distributeByOwnership = (asset, amount, accumulator) => {
-      const shares = asset?.ownershipShares || {};
-      const validEntries = Object.entries(shares).filter(([eid, pct]) => earners.some(e => e.id === eid) && pct > 0);
-      if (validEntries.length > 0) {
-        const totalPct = validEntries.reduce((s, [, p]) => s + p, 0);
-        validEntries.forEach(([eid, pct]) => {
-          accumulator[eid] = (accumulator[eid] || 0) + amount * (pct / totalPct);
-        });
-        return;
-      }
-      // Fallback: legacy earnerId or first AUD earner
-      const fallback = asset?.earnerId
-        || earners.find(en => (en.currency || "AUD") === "AUD" && (en.taxMode || "ato") === "ato" && !earnerState[en.id].retired)?.id
-        || earners[0]?.id;
-      if (fallback) accumulator[fallback] = (accumulator[fallback] || 0) + amount;
-    };
-
-    // Second pass: per-asset rental result for INVESTMENT properties.
-    // Primary residence: no rental income, running expenses are personal (not deductible),
-    // mortgage interest is not deductible.
-    assets.forEach(a => {
-      if (!isInvestmentProperty(a)) return;
-      const scale = balances[a.id] / (a.value || 1);
-      const grossRental = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
-      const runningExp = (a.runningExpenses || 0);
-      // Interest on all loans attached to this investment property is deductible
-      let propertyInvestmentInterest = 0;
-      Object.keys(loanMeta).forEach(key => {
-        const m = loanMeta[key];
-        if (m.assetId === a.id) {
-          propertyInvestmentInterest += interestThisYear[key] || 0;
-        }
-      });
-      const netRental = grossRental - runningExp - propertyInvestmentInterest;
-      distributeByOwnership(a, netRental, rentalAdjustmentByEarner);
-      totalRentalIncome += grossRental;
-      totalRentalExpenses += runningExp;
-      totalInvestmentInterest += propertyInvestmentInterest;
-    });
-
-    // Standalone investment debts (non-property): interest is deductible to the loan's earner
-    Object.keys(loanMeta).forEach(key => {
-      const m = loanMeta[key];
-      if (m.assetId) return; // already handled above (attached to a property)
-      if (!m.isInvestment) return;
-      const i = interestThisYear[key] || 0;
-      if (i === 0) return;
-      const ownerId = m.earnerId || earners[0]?.id;
-      if (ownerId) {
-        rentalAdjustmentByEarner[ownerId] = (rentalAdjustmentByEarner[ownerId] || 0) - i;
-      }
-      totalInvestmentInterest += i;
-    });
-    // ========== END PROPERTY TAX ATTRIBUTION ==========
-
-    let totalGross = 0, totalNet = 0, totalTax = 0;
-    // Cashflow chart components — separately track each for stacking
-    let cfSalary = 0;        // base salaries across all earners (AUD)
-    let cfCashBonus = 0;     // cash bonuses across all earners (AUD)
-    // Net rental result (signed; can be negative-geared). Includes rental income minus running
-    // expenses minus deductible investment-loan interest. Computed from the rental block above.
-    let cfRentalNet = totalRentalIncome - totalRentalExpenses - totalInvestmentInterest;
-    const superContribByEarner = {};   // total NET amount entering super (after contribs tax)
-    const shareBonusByEarner = {};      // share bonus value (AUD) routed to share plan asset
-
-    // ===== Asset income (non-property): attribute to owner-earner for tax =====
-    // Equities and sharePlan use dividendYield (% of value). Other categories use flat income.
-    let assetIncome = 0;
-    let propertyCashFlow = 0;
-    const assetIncomeAdjustmentByEarner = {}; // earnerId → grossed-up dividend/interest income (added to taxable)
-    const frankingCreditByEarner = {};        // earnerId → franking credits to offset tax
-    assets.forEach(a => {
-      if (a.category === "offset") return; // offsets earn no income
-      if (a.category === "primaryResidence") return; // PR has no rental, no income
-      // Compute gross income for this asset
-      let grossIncome;
-      if (a.category === "equities") {
-        grossIncome = (balances[a.id] || 0) * ((a.dividendYield || 0) / 100);
-      } else {
-        const scale = balances[a.id] / (a.value || 1);
-        grossIncome = (a.income || 0) * (isFinite(scale) ? Math.max(0, scale) : 1);
-      }
-      if (a.category === "investmentProperty" || a.category === "property") {
-        // Investment properties: rent and running expenses go to propertyCashFlow.
-        // (Tax effect is handled separately above via rentalAdjustmentByEarner.)
-        const runningExp = (a.runningExpenses || 0);
-        propertyCashFlow += grossIncome - runningExp;
-      } else if (grossIncome > 0) {
-        assetIncome += grossIncome;
-        const frankedPct = (a.frankedRate || 0) / 100;
-        const grossedUp = grossIncome + grossIncome * frankedPct * (30 / 70);
-        const frankingCredit = grossIncome * frankedPct * (30 / 70);
-        distributeByOwnership(a, grossedUp, assetIncomeAdjustmentByEarner);
-        if (frankingCredit > 0) distributeByOwnership(a, frankingCredit, frankingCreditByEarner);
-      }
-    });
-
-    // ===== CGT on asset-sale events occurring this year =====
-    // The "asset sale" event type takes proceeds + cost base. Discounted gain (if held >12 months)
-    // adds to owner's taxable income. Net proceeds (after CGT) flow into cash via the lump.
-    const cgtAdjustmentByEarner = {}; // earnerId → discounted capital gain (added to taxable)
-    let cgtTaxThisYear = 0; // CGT actually paid this year (separate KPI)
-    events.forEach(ev => {
-      if (ev.type !== "assetSale") return;
-      if (y < ev.yearOffset || y >= ev.yearOffset + (ev.duration || 1)) return;
-      const proceeds = ev.amount || 0;
-      const costBase = ev.costBase || 0;
-      const gain = Math.max(0, proceeds - costBase);
-      const discountedGain = ev.heldOverYear !== false ? gain * 0.5 : gain;
-      const ownerId = ev.ownerId || (earners.find(en => (en.currency || "AUD") === "AUD" && (en.taxMode || "ato") === "ato")?.id);
-      if (ownerId && discountedGain > 0) {
-        cgtAdjustmentByEarner[ownerId] = (cgtAdjustmentByEarner[ownerId] || 0) + discountedGain;
-      }
-    });
-
-    // Pre-compute per-earner deductible salary sacrifice (needed for MLS add-back later).
-    // This duplicates a small piece of the main earner loop's logic, but doing it here lets us
-    // compute MLS income before the main tax computation.
-    const deductibleSacrificeByEarner = {};
-    earners.forEach(e => {
-      const st = earnerState[e.id];
-      if (st.retired || (e.currency || "AUD") !== "AUD") { deductibleSacrificeByEarner[e.id] = 0; return; }
-      const base = st.salary;
-      const bonusCash = base * ((e.bonusRateCash || 0) / 100);
-      const bonusShares = base * ((e.bonusRateShares || 0) / 100);
-      const grossAud = base + bonusCash + bonusShares;
-      const sgBase = (e.superSgIncludesBonus ? grossAud : base);
-      const sgContrib = sgBase * ((e.superSgRate ?? 12) / 100);
-      const matchConcessional = grossAud * ((e.superMatchConcessionalRate || 0) / 100);
-      const extraConcessional = grossAud * ((e.superExtraConcessionalRate || 0) / 100);
-      const capRoom = Math.max(0, concessionalCap - sgContrib - matchConcessional);
-      deductibleSacrificeByEarner[e.id] = Math.min(extraConcessional, capRoom);
-    });
-
-    // Pre-compute household MLS income for family thresholds.
-    // ATO definition of MLS income: taxable income + reportable super contribs (deductible sal-sac)
-    //   + net investment losses (added back when negative) + (we don't model FBT or trust dist).
-    // MLS income per earner = taxable + deductible sal-sac (added back) + max(0, -rentalAdj) (negative
-    //   gearing losses added back). Asset income and CGT are already in taxable.
-    const mlsIncomeByEarner = {};
-    let householdMlsIncome = 0;
-    earners.forEach(e => {
-      const st = earnerState[e.id];
-      if (st.retired || (e.currency || "AUD") !== "AUD" || (e.taxMode || "ato") !== "ato") {
-        mlsIncomeByEarner[e.id] = 0;
-        return;
-      }
-      const base = st.salary;
-      const bonus = base * (((e.bonusRateCash || 0) + (e.bonusRateShares || 0)) / 100);
-      const rentalAdj = rentalAdjustmentByEarner[e.id] || 0;
-      const assetAdj = assetIncomeAdjustmentByEarner[e.id] || 0;
-      const cgtAdj = cgtAdjustmentByEarner[e.id] || 0;
-      const taxableForMls = base + bonus - (deductibleSacrificeByEarner[e.id] || 0) + rentalAdj + assetAdj + cgtAdj;
-      // Add back: deductible sacrifice + abs of any negative rental
-      const addBackSacrifice = deductibleSacrificeByEarner[e.id] || 0;
-      const addBackInvestmentLoss = rentalAdj < 0 ? -rentalAdj : 0;
-      const mlsIncome = Math.max(0, taxableForMls) + addBackSacrifice + addBackInvestmentLoss;
-      mlsIncomeByEarner[e.id] = mlsIncome;
-      householdMlsIncome += mlsIncome;
-    });
-
-    // Count of dependent kids in this year (for MLS family threshold uplift)
-    const dependentKidsThisYear = kids.filter(k => kidState[k.id]?.yearsRemaining > 0).length;
-
-    // Pre-compute household income for MLS family thresholds (sum of all AUD ATO earners, after rental adj)
-    let householdAtoIncome = 0;
-    earners.forEach(e => {
-      const st = earnerState[e.id];
-      if (!st.retired && (e.currency || "AUD") === "AUD" && (e.taxMode || "ato") === "ato") {
-        const base = st.salary;
-        const bonus = base * (((e.bonusRateCash || 0) + (e.bonusRateShares || 0)) / 100);
-        const rentalAdj = rentalAdjustmentByEarner[e.id] || 0;
-        const assetAdj = assetIncomeAdjustmentByEarner[e.id] || 0;
-        const cgtAdj = cgtAdjustmentByEarner[e.id] || 0;
-        householdAtoIncome += base + bonus + rentalAdj + assetAdj + cgtAdj;
-      }
-    });
-
-    const earnerBreakdown = {};
-    earners.forEach(e => {
-      const st = earnerState[e.id];
-      const base = st.retired ? 0 : st.salary;
-      const bonusCash = st.retired ? 0 : base * ((e.bonusRateCash || 0) / 100);
-      const bonusShares = st.retired ? 0 : base * ((e.bonusRateShares || 0) / 100);
-      const bonus = bonusCash + bonusShares;
-      const grossLocal = base + bonus;
-
-      const currency = e.currency || "AUD";
-      const fx = currency === "SGD" ? fxSgdAud : 1.0;
-      const grossAud = grossLocal * fx;
-      const baseAud = base * fx;
-      const bonusCashAud = bonusCash * fx;
-      const bonusSharesAud = bonusShares * fx;
-
-      // ===== Super contributions: compute first (needed for taxable-income calculation) =====
-      let sgContrib = 0, extraConcessional = 0, nonConcessional = 0;
-      let matchConcessional = 0, matchNonConcessional = 0;
-      let totalConcessional = 0, totalNonConcessional = 0;
-      let concessionalWithinCap = 0, concessionalExcess = 0;
-      let nonConcessionalWithinCap = 0, nonConcessionalExcess = 0;
-      let concessionalTax = 0, div293Tax = 0, excessConcessionalTax = 0;
-      let netSuperIn = 0;
-      // Salary sacrifice that successfully reduces taxable income (capped at concessional cap minus SG/match)
-      let taxDeductibleSacrifice = 0;
-
-      if (!st.retired && currency === "AUD") {
-        // SG: by default on base only; opt-in to include bonus
-        const sgBase = (e.superSgIncludesBonus ? grossAud : baseAud);
-        sgContrib = sgBase * ((e.superSgRate ?? 12) / 100);
-        extraConcessional = grossAud * ((e.superExtraConcessionalRate || 0) / 100);
-        nonConcessional = grossAud * ((e.superExtraNonConcessionalRate || 0) / 100);
-        matchConcessional = grossAud * ((e.superMatchConcessionalRate || 0) / 100);
-        matchNonConcessional = grossAud * ((e.superMatchNonConcessionalRate || 0) / 100);
-
-        totalConcessional = sgContrib + extraConcessional + matchConcessional;
-        totalNonConcessional = nonConcessional + matchNonConcessional;
-
-        concessionalWithinCap = Math.min(totalConcessional, concessionalCap);
-        concessionalExcess = Math.max(0, totalConcessional - concessionalCap);
-
-        // Salary sacrifice that successfully reduces taxable income — only the portion within cap.
-        // Order: SG and match are mandatory; sacrifice fills remaining cap room.
-        const capRoomAfterSgAndMatch = Math.max(0, concessionalCap - sgContrib - matchConcessional);
-        taxDeductibleSacrifice = Math.min(extraConcessional, capRoomAfterSgAndMatch);
-
-        concessionalTax = totalConcessional * SUPER_CONTRIB_TAX;
-
-        // Div 293: applies to within-cap concessional when (taxable income before sacrifice) + concessional > $250k
-        const div293Income = grossAud + concessionalWithinCap;
-        if (div293Income > DIV293_THRESHOLD) {
-          const excessOverThreshold = div293Income - DIV293_THRESHOLD;
-          const div293Base = Math.min(concessionalWithinCap, excessOverThreshold);
-          div293Tax = div293Base * DIV293_EXTRA_TAX;
-        }
-
-        nonConcessionalWithinCap = Math.min(totalNonConcessional, nonConcessionalCap);
-        nonConcessionalExcess = Math.max(0, totalNonConcessional - nonConcessionalCap);
-
-        // Excess concessional: still hits the fund and is taxed 15% there. The personal MTR-minus-15%
-        // tax is added to taxAud below. The post-15% remainder stays in super (default ATO outcome
-        // when user doesn't issue a release authority).
-        // Excess non-concessional: already after-tax money — full amount stays in super (no penalty
-        // modelled; user assumed not to withdraw via release authority).
-        netSuperIn = (concessionalWithinCap + concessionalExcess) * (1 - SUPER_CONTRIB_TAX)
-                   + nonConcessionalWithinCap + nonConcessionalExcess;
-      }
-
-      // ===== Compute taxable income (now that we know the deductible sacrifice) =====
-      // Taxable income for ATO earners = gross − deductible salary sacrifice + rental + asset income (grossed-up) + CGT
-      // For SG earners and flat-tax mode, these don't apply.
-      const isAudAto = (currency === "AUD" && (e.taxMode || "ato") === "ato");
-      const rentalAdj = isAudAto ? (rentalAdjustmentByEarner[e.id] || 0) : 0;
-      const assetAdj = isAudAto ? (assetIncomeAdjustmentByEarner[e.id] || 0) : 0;
-      const cgtAdj = isAudAto ? (cgtAdjustmentByEarner[e.id] || 0) : 0;
-      const frankingCredit = isAudAto ? (frankingCreditByEarner[e.id] || 0) : 0;
-      const taxableLocal = (currency === "AUD")
-        ? (grossLocal - taxDeductibleSacrifice / fx + (rentalAdj + assetAdj + cgtAdj) / fx)
-        : grossLocal;
-      const earnerMlsIncome = isAudAto ? (mlsIncomeByEarner[e.id] || 0) : undefined;
-      const taxLocalBeforeFranking = computeEarnerTax(e, taxableLocal, currency === "AUD" ? householdMlsIncome : undefined, dependentKidsThisYear, earnerMlsIncome);
-      // Franking credits offset tax 1-for-1 (refundable for low-income; here we cap at total tax for simplicity)
-      const taxLocal = Math.max(0, taxLocalBeforeFranking - frankingCredit / fx);
-
-      let taxAud = taxLocal * fx;
-      // Excess concessional: on ATO earners, taxed at marginal rate over and above the 15% contribs tax
-      if (concessionalExcess > 0 && (e.taxMode || "ato") === "ato") {
-        const taxAtGross = atoTotalTax(taxableLocal * fx, e.hasPrivateHealth !== false, householdMlsIncome, dependentKidsThisYear, earnerMlsIncome);
-        const taxAtPlus1k = atoTotalTax(taxableLocal * fx + 1000, e.hasPrivateHealth !== false, householdMlsIncome, dependentKidsThisYear, earnerMlsIncome);
-        const mtr = (taxAtPlus1k - taxAtGross) / 1000;
-        excessConcessionalTax = concessionalExcess * Math.max(0, mtr - SUPER_CONTRIB_TAX);
-      } else if (concessionalExcess > 0) {
-        excessConcessionalTax = concessionalExcess * Math.max(0, ((e.taxRate || 30) / 100) - SUPER_CONTRIB_TAX);
-      }
-      taxAud += div293Tax + excessConcessionalTax;
-
-      // ===== Net cash to household =====
-      // Starts from (gross − tax) in AUD, minus things that don't reach the wallet:
-      //   - share bonus value (routed to share plan)
-      //   - salary sacrifice (taken pre-tax, but it's the deductible portion that's removed from gross already
-      //     via the lower taxable income; for non-deductible excess, those dollars still leave the wallet)
-      //   - non-concessional contributions (paid from after-tax cash)
-      //   - Div 293 + excess concessional tax (paid by individual)
-      // Note: extra concessional NOT in the deductible portion (i.e. the excess amount) is still removed from
-      // wallet because it's still going to super; just not tax-deductible.
-      const nonDeductibleSacrifice = Math.max(0, extraConcessional - taxDeductibleSacrifice);
-      let netAud = grossAud - taxAud - bonusSharesAud - taxDeductibleSacrifice - nonDeductibleSacrifice - nonConcessional;
-      // (Note: taxAud already includes div293 and excess concessional tax above)
-
-      const netLocal = taxableLocal - taxLocal;  // simplified local-currency net (for SG earner display)
-
-      totalGross += grossAud;
-      totalNet += netAud;
-      totalTax += taxAud;
-      // Cashflow chart components (salary base + cash bonuses; share bonuses go directly to shares)
-      cfSalary += baseAud;
-      cfCashBonus += bonusCashAud;
-      superContribByEarner[e.id] = netSuperIn;
-      shareBonusByEarner[e.id] = bonusSharesAud;
-      earnerBreakdown[e.id] = {
-        name: e.name, currency, fx,
-        baseLocal: base, bonusLocal: bonus, bonusCashLocal: bonusCash, bonusSharesLocal: bonusShares,
-        grossLocal, taxableLocal, taxLocal, netLocal,
-        base: baseAud, bonus: bonus * fx, bonusCash: bonusCashAud, bonusShares: bonusSharesAud,
-        gross: grossAud, taxable: taxableLocal * fx, tax: taxAud, net: netAud,
-        retired: st.retired,
-        // Super components (AUD only)
-        sgContrib, extraConcessional, nonConcessional, matchConcessional, matchNonConcessional,
-        taxDeductibleSacrifice,
-        totalConcessional, totalNonConcessional,
-        concessionalWithinCap, concessionalExcess,
-        nonConcessionalWithinCap, nonConcessionalExcess,
-        concessionalTax, div293Tax, excessConcessionalTax,
-        netSuperIn,
-        // Tax-related metadata for transparency
-        hasPrivateHealth: e.hasPrivateHealth !== false,
-        sgIncludesBonus: !!e.superSgIncludesBonus,
-      };
-    });
-
-    // Amortisation: use precomputed offset-aware interest. Principal = scheduled payment − interest.
-    let totalLiabPayment = 0;
-    Object.keys(liabs).forEach(key => {
-      if (liabs[key] <= 0) return;
-      const m = loanMeta[key];
-      if (!m) return;
-      if (m.type === "pi" && m.yearsElapsed >= m.termYears) {
-        liabs[key] = 0;
-        return;
-      }
-      const r = m.rate / 100;
-      const interest = interestThisYear[key] || 0;
-      let payment;
-      if (m.type === "io") {
-        if (m.yearsElapsed < m.ioPeriod) {
-          // During the IO period: interest only
-          payment = interest;
-        } else {
-          // After IO period: convert to P&I, amortise current balance over REMAINING term
-          const remainingTerm = Math.max(1, m.termYears - m.ioPeriod);
-          const yearsInPi = m.yearsElapsed - m.ioPeriod;
-          if (yearsInPi >= remainingTerm) {
-            // Beyond P&I term too — should have paid off already
-            liabs[key] = 0;
-            payment = 0;
-          } else {
-            // P&I payment is computed on the balance AT conversion (capture once via originalBalance)
-            // We use current balance as the basis since we don't store conversion balance separately —
-            // simpler approximation: amortise over remainingTerm starting now.
-            const P = liabs[key] + interest; // approximate balance at start of this year
-            const n = remainingTerm - yearsInPi;
-            payment = r === 0 ? P / n : P * r / (1 - Math.pow(1 + r, -n));
-            if (payment > liabs[key] + interest) payment = liabs[key] + interest;
-          }
-        }
-      } else {
-        const P = m.originalBalance || liabs[key];
-        const n = m.termYears;
-        payment = r === 0 ? P / n : P * r / (1 - Math.pow(1 + r, -n));
-        if (payment > liabs[key] + interest) payment = liabs[key] + interest;
-      }
-      const principal = Math.max(0, payment - interest);
-      liabs[key] = Math.max(0, liabs[key] - principal);
-      totalLiabPayment += payment;
-      m.yearsElapsed += 1;
-    });
-
-    let schoolFees = 0;
-    const feesByKid = {};
-    kids.forEach(k => {
-      const st = kidState[k.id];
-      if (st.yearsRemaining > 0) {
-        schoolFees += st.fees;
-        feesByKid[k.id] = { name: k.name, fees: st.fees };
-      }
-    });
-
-    // Determine if household is fully retired this year (used for retirement spending multiplier)
-    const allRetiredThisYear = earners.length > 0 && earners.every(e => earnerState[e.id].retired);
-    const retirementMult = allRetiredThisYear ? (meta.retirementSpendingMultiplier ?? 1.0) : 1.0;
-
-    // Living expenses: sum active items (within start/end window)
-    // When household is fully retired, scale by retirementSpendingMultiplier (default 1.0 = no change).
-    let expenses = 0;
-    const expenseBreakdown = {};
-    expenseItems.forEach(x => {
-      const startY = x.startYear ?? 0;
-      const endY = x.endYear;
-      const active = y >= startY && (endY == null || y <= endY);
-      if (active) {
-        const adjusted = expenseState[x.id] * retirementMult;
-        expenses += adjusted;
-        expenseBreakdown[x.id] = { name: x.name, amount: adjusted, growthPct: x.growth || 0, startYear: x.startYear ?? 0 };
-      }
-    });
-
-    let eventExpense = 0;
-    let eventLump = 0;
-    let eventLumpCategory = "cash";
-    const activeEvents = [];
-    events.forEach(e => {
-      const active = y >= e.yearOffset && y < e.yearOffset + (e.duration || 1);
-      if (!active) return;
-      activeEvents.push(e.name);
-      if (e.type === "expense") eventExpense += e.amount;
-      if (e.type === "lump" && y === e.yearOffset) {
-        eventLump += e.amount;
-        eventLumpCategory = e.category || "cash";
-      }
-      if (e.type === "assetSale" && y === e.yearOffset) {
-        // Proceeds enter cash; CGT (if any) was added to the owner's taxable income, so the tax bill
-        // already captures the CGT cost. Net wealth effect = proceeds (full) less tax bill increase.
-        eventLump += e.amount;
-        eventLumpCategory = e.category || "cash";
-      }
-      if (e.type === "income") assetIncome += e.amount;
-    });
-
-    const netCashflow = totalNet + assetIncome + propertyCashFlow - expenses - totalLiabPayment - eventExpense - schoolFees;
-
-    // Asset growth — offset accounts don't grow (their benefit is reducing loan interest, not earning return)
-    assets.forEach(a => {
-      if (a.category === "offset") return;
-      balances[a.id] = balances[a.id] * (1 + a.growth / 100);
-    });
-
-    earners.forEach(e => {
-      const contrib = superContribByEarner[e.id];
-      if (!contrib) return;
-      const earnerSupers = assets.filter(a => a.category === "super" && a.earnerId === e.id);
-      if (earnerSupers.length > 0) {
-        const per = contrib / earnerSupers.length;
-        earnerSupers.forEach(a => { balances[a.id] += per; });
-      } else {
-        const anySupers = assets.filter(a => a.category === "super");
-        if (anySupers.length > 0) {
-          const per = contrib / anySupers.length;
-          anySupers.forEach(a => { balances[a.id] += per; });
-        }
-      }
-    });
-
-    // ===== Route share bonus to chosen Shares asset =====
-    // Each earner can pick `sharePlanAssetId` — one asset their share bonus vests into.
-    // Fallback chain: chosen asset → first equity asset → silently lost (user warning shown elsewhere)
-    earners.forEach(e => {
-      const shareIn = shareBonusByEarner[e.id];
-      if (!shareIn) return;
-      const target = e.sharePlanAssetId
-        ? assets.find(a => a.id === e.sharePlanAssetId && a.category === "equities")
-        : null;
-      if (target) {
-        balances[target.id] += shareIn;
-        return;
-      }
-      // Fallback: first equity asset (if any)
-      const anyEquity = assets.find(a => a.category === "equities");
-      if (anyEquity) {
-        balances[anyEquity.id] += shareIn;
-      }
-      // Otherwise lost — earner row shows a warning
-    });
-
-    const cashAssets = assets.filter(a => a.category === "cash");
-    if (cashAssets.length > 0) balances[cashAssets[0].id] += netCashflow;
-    if (eventLump !== 0) {
-      const targets = assets.filter(a => a.category === eventLumpCategory);
-      if (targets.length > 0) balances[targets[0].id] += eventLump;
-      else if (cashAssets.length > 0) balances[cashAssets[0].id] += eventLump;
-    }
-
-    // ===== End-of-year cash sweep automation =====
-    // If user has enabled cash optimisation, sweep cash above the buffer into the chosen target.
-    // Modes: "off" (no sweep) | "offset" (into a designated loan's offsetBalance) | "equities" (into a designated equity asset).
-    // For "offset" mode, if the target loan can only absorb part of the excess (because its balance
-    // is smaller than excess), the remainder spills to the designated equity asset.
-    const opt = meta.cashOptimisation || {};
-    if (opt.enabled && opt.mode && opt.mode !== "off") {
-      const sourceId = opt.sweepSourceAssetId;
-      const sourceAsset = assets.find(a => a.id === sourceId && a.category === "cash");
-      if (sourceAsset) {
-        const buffer = opt.minBuffer || 0;
-        let excess = (balances[sourceAsset.id] || 0) - buffer;
-        if (excess > 0) {
-          if (opt.mode === "offset" && opt.sweepTargetOffsetLoanKey) {
-            const loanKey = opt.sweepTargetOffsetLoanKey;
-            if (liabs[loanKey] != null) {
-              // Available room = loan balance − current offset balance
-              const room = Math.max(0, liabs[loanKey] - (offsetByLoan[loanKey] || 0));
-              const intoOffset = Math.min(excess, room);
-              if (intoOffset > 0) {
-                offsetByLoan[loanKey] = (offsetByLoan[loanKey] || 0) + intoOffset;
-                balances[sourceAsset.id] -= intoOffset;
-                excess -= intoOffset;
-              }
-            }
-          }
-          // Remaining excess (or pure equities mode) flows to the designated equity asset
-          if (excess > 0 && opt.sweepTargetEquityAssetId) {
-            const equityAsset = assets.find(a => a.id === opt.sweepTargetEquityAssetId && (a.category === "equities"));
-            if (equityAsset) {
-              balances[equityAsset.id] = (balances[equityAsset.id] || 0) + excess;
-              balances[sourceAsset.id] -= excess;
-            }
-          }
-        }
-      }
-    }
-    // ===== END cash sweep =====
-
-    // ===== Excess offset drain =====
-    // For each loan: if offset > loan balance, route the overflow somewhere productive.
-    // Route order: configured equity target → first cash asset.
-    // Runs every year regardless of whether cash optimisation is enabled.
-    Object.keys(offsetByLoan).forEach(key => {
-      const overflow = (offsetByLoan[key] || 0) - (liabs[key] || 0);
-      if (overflow > 0) {
-        offsetByLoan[key] = liabs[key] || 0;
-        // Try equity target first (if configured)
-        const optDrain = meta.cashOptimisation || {};
-        const equityTarget = optDrain.sweepTargetEquityAssetId
-          ? assets.find(a => a.id === optDrain.sweepTargetEquityAssetId && a.category === "equities")
-          : null;
-        if (equityTarget) {
-          balances[equityTarget.id] = (balances[equityTarget.id] || 0) + overflow;
-        } else {
-          // Fallback: first cash asset
-          const firstCash = assets.find(a => a.category === "cash");
-          if (firstCash) {
-            balances[firstCash.id] = (balances[firstCash.id] || 0) + overflow;
-          }
-          // If no cash asset either, the overflow is silently lost (rare; would mean no cash at all in scenario)
-        }
-      }
-    });
-    // ===== END excess offset drain =====
-
-    const byCat = { primaryResidence: 0, investmentProperty: 0, equities: 0, cash: 0, offset: 0, super: 0, other: 0 };
-    assets.forEach(a => { byCat[a.category] = (byCat[a.category] || 0) + balances[a.id]; });
-    // Sum loan-attached offset balances into the cash stack for the wealth chart.
-    // (Offsets are conceptually cash that's reducing loan interest — still household money.)
-    Object.values(offsetByLoan).forEach(bal => { byCat.offset += bal || 0; });
-    const totalAssets = Object.values(byCat).reduce((s, v) => s + v, 0);
-    const totalLiab = Object.values(liabs).reduce((s, v) => s + v, 0);
-    const netWealth = totalAssets - totalLiab;
-
-    const allRetired = earners.every(e => earnerState[e.id].retired);
-    const anyRetired = earners.some(e => earnerState[e.id].retired);
-
-    // Per-loan balances flattened as top-level row fields (loan_KEY) for stacked chart use.
-    // Also include a structured loanBreakdown for the Trace tab.
-    const loanFlat = {};
-    const loanBreakdown = {};
-    Object.keys(liabs).forEach(key => {
-      loanFlat[`loan_${key}`] = liabs[key];
-      loanBreakdown[key] = {
-        balance: liabs[key],
-        offset: offsetByLoan[key] || 0,
-        rate: loanMeta[key]?.rate || 0,
-        type: loanMeta[key]?.type,
-        assetId: loanMeta[key]?.assetId,
-      };
-    });
-
-    // Per-asset balances flattened (assetbal_<assetId>) so per-category chart views can stack
-    // each individual asset within the category as its own band.
-    const assetFlat = {};
-    assets.forEach(a => {
-      assetFlat[`assetbal_${a.id}`] = balances[a.id] || 0;
-    });
-    // Per-loan offset balances flattened (offsetbal_<loanKey>) so the Mortgage Offset view can
-    // stack each loan's offset as its own band.
-    const offsetFlat = {};
-    Object.keys(offsetByLoan).forEach(key => {
-      offsetFlat[`offsetbal_${key}`] = offsetByLoan[key] || 0;
-    });
-
-    rows.push({
-      year: y, age, ...byCat, totalAssets, liabilities: totalLiab, netWealth, netCashflow,
-      totalGross, totalNet, totalTax, expenses, expenseBreakdown,
-      schoolFees, earnerBreakdown, feesByKid, allRetired, anyRetired, activeEvents,
-      // Per-loan balance fields for stacked liability chart
-      ...loanFlat,
-      // Per-asset balance fields for per-category stacked chart views
-      ...assetFlat,
-      // Per-loan offset balance fields for Mortgage Offset view
-      ...offsetFlat,
-      loanBreakdown,
-      // Engine internals exposed for the calculation Trace tab:
-      totalLiabPayment, assetIncome, eventLump, eventExpense,
-      // ===== Cashflow chart fields =====
-      // Income-side (positive values stack above x-axis) — cash only, no share grants
-      cf_salary: cfSalary,
-      cf_cashBonus: cfCashBonus,
-      cf_assetIncome: assetIncome,                                // dividends, interest from non-property assets
-      cf_rentalPos: cfRentalNet > 0 ? cfRentalNet : 0,            // positive when rent > expenses+interest
-      cf_eventIncome: eventLump > 0 ? eventLump : 0,              // one-off positive lumps
-      // Expense-side (negative values stack below x-axis)
-      cf_living: -expenses,
-      cf_schoolFees: -schoolFees,
-      cf_loanRepayments: -totalLiabPayment,
-      cf_rentalNeg: cfRentalNet < 0 ? cfRentalNet : 0,            // negative-gearing year
-      cf_tax: -totalTax,                                          // total household tax (income tax + Medicare + MLS + super excess)
-      cf_eventExpense: -eventExpense,
-      // Net cashflow — true free cash at end of year (income minus all expenses including tax)
-      cf_net: cfSalary + cfCashBonus + assetIncome + cfRentalNet + (eventLump > 0 ? eventLump : 0)
-            - expenses - schoolFees - totalLiabPayment - totalTax - eventExpense,
-    });
-
-    earners.forEach(e => {
-      if (!earnerState[e.id].retired) earnerState[e.id].salary *= (1 + e.salaryGrowth / 100);
-    });
-    // Grow each expense item by its own growth rate
-    expenseItems.forEach(x => {
-      expenseState[x.id] *= (1 + (x.growth || 0) / 100);
-    });
-    kids.forEach(k => {
-      const st = kidState[k.id];
-      if (st.yearsRemaining > 0) {
-        st.fees *= (1 + k.feeGrowth / 100);
-        st.yearsRemaining -= 1;
-      }
-    });
-  }
-
-  return rows;
-}
 
 // ---------- Utilities ----------
 const fmt = (n) => {
@@ -1417,31 +161,6 @@ function useDragReorder(items, onReorder) {
   return { handlersFor, draggingIdx };
 }
 
-// Six-dot drag handle to grab a row by. Sits on the left edge.
-function DragHandle({ onMouseDown }) {
-  return (
-    <div
-      onMouseDown={onMouseDown}
-      title="Drag to reorder"
-      role="button"
-      aria-label="Drag to reorder"
-      style={{
-        cursor: "grab",
-        color: C.textMute,
-        opacity: 0.5,
-        padding: "0 4px",
-        userSelect: "none",
-        display: "flex",
-        alignItems: "center",
-        fontSize: 12,
-        letterSpacing: "-2px",
-      }}
-    >
-      ⋮⋮
-    </div>
-  );
-}
-
 // Generic sortable list wrapper. Renders each item with a drag handle and supports
 // HTML5 drag-and-drop reordering. The render fn receives the item (no special props).
 // Only the drag handle starts drags — the rest of the row stays clickable for editing.
@@ -1505,7 +224,6 @@ export default function FinancialPlanner() {
   const [showSettings, setShowSettings] = useState(false);
   const [selectedYear, setSelectedYear] = useState(null);
   const [activeTab, setActiveTab] = useState("planner");
-  const [hoverYear, setHoverYear] = useState(null);
   const [displayMode, setDisplayMode] = useState("nominal");
 
   // ===== Auth state =====
@@ -1551,11 +269,11 @@ export default function FinancialPlanner() {
   // ===== Load scenarios when ready (Supabase if authenticated, else localStorage) =====
   useEffect(() => {
     if (!authReady) return;
-    // Reset the supabaseIdByName ref whenever auth state changes — a different user means different IDs
+    // Reset the id/version refs whenever auth state changes — a different user means different rows
     supabaseIdByName.current = {};
+    supabaseVersionByName.current = {};
     (async () => {
-      let loadedData = null;
-      let didMigrateLocal = false;
+      let loadedData;
 
       if (SUPABASE_ENABLED && session?.user?.id) {
         // Logged in to Supabase — try to load from there first
@@ -1578,7 +296,6 @@ export default function FinancialPlanner() {
                   if (result.idByName[name]) supabaseIdByName.current[name] = result.idByName[name];
                 });
                 loadedData = { scenarios: migratedLocal, active: local.active };
-                didMigrateLocal = true;
                 setToast({ kind: "ok", msg: `Migrated ${Object.keys(migratedLocal).length} scenarios to cloud` });
               }
             }
@@ -1613,17 +330,22 @@ export default function FinancialPlanner() {
         setScenarios({ "Base case": DEFAULT_STATE });
         setActiveScenario("Base case");
       }
+      // The state updates above re-fire the save effect with exactly the data that
+      // was just read — flag it so that first save is skipped (otherwise every load
+      // writes back to the cloud and bumps every row's version for nothing).
+      justLoadedRef.current = true;
       setLoaded(true);
       // Reset slider when session changes so the user sees the new horizon
       setSelectedYear(null);
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authReady, session?.user?.id]);
 
   // Track Supabase row IDs by scenario name in a ref — does NOT trigger re-renders or re-saves
   const supabaseIdByName = useRef({});
   // Track the last-known Supabase version per scenario for optimistic concurrency
   const supabaseVersionByName = useRef({});
+  // True right after scenarios were loaded — suppresses the immediate echo-save
+  const justLoadedRef = useRef(false);
   // Stale-write modal state: shown when a save fails because version is stale
   const [staleConflict, setStaleConflict] = useState(null); // null | { conflicts: string[] }
   // File workflow state
@@ -1640,6 +362,9 @@ export default function FinancialPlanner() {
   useEffect(() => {
     if (!loaded) return;
     saveToLocalStorage({ scenarios, active: activeScenario }); // always cache locally
+
+    // Skip the save that fires immediately after a load — nothing has changed yet.
+    if (justLoadedRef.current) { justLoadedRef.current = false; return; }
 
     // === File mode: writing to local file ===
     if (fileHandle) {
@@ -1765,12 +490,13 @@ export default function FinancialPlanner() {
         setToast({ kind: "ok", msg: `Loaded ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
         return;
       }
-      // Existing scenarios present → ask user: replace or merge?
+      // Existing scenarios present → ask user: replace, merge, or cancel?
       setConfirmModal({
         title: "Load scenarios from file",
         msg: `This file contains ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"}: ${incomingNames.join(", ")}. You currently have ${existingNames.length} scenario${existingNames.length === 1 ? "" : "s"}. What would you like to do?`,
         confirmLabel: "Replace all",
-        cancelLabel: "Merge in",
+        altLabel: "Merge in",
+        cancelLabel: "Cancel",
         onConfirm: () => {
           // Replace
           setScenarios(migratedIncoming);
@@ -1782,7 +508,7 @@ export default function FinancialPlanner() {
           setFileSyncStatus("saved");
           setToast({ kind: "ok", msg: `Replaced with ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
         },
-        onCancel: () => {
+        onAlt: () => {
           // Merge — incoming scenarios added; name collisions get "(imported)" suffix
           const merged = { ...scenarios };
           for (const [name, scen] of Object.entries(migratedIncoming)) {
@@ -1802,6 +528,7 @@ export default function FinancialPlanner() {
           setFileSyncStatus("saved");
           setToast({ kind: "ok", msg: `Merged ${incomingNames.length} scenario${incomingNames.length === 1 ? "" : "s"} from ${baseName}` });
         },
+        // Cancel = do nothing (previously cancel meant "merge", which surprised nobody in a good way)
       });
     } catch (err) {
       if (err && err.name !== "AbortError") {
@@ -2072,6 +799,16 @@ export default function FinancialPlanner() {
       setToast({ kind: "err", msg: `"${trimmed}" already exists` });
       return;
     }
+    // Move the Supabase id/version refs to the new name — otherwise the next save
+    // would INSERT a new row (duplicate) and orphan the old one in the cloud.
+    if (supabaseIdByName.current[oldName]) {
+      supabaseIdByName.current[trimmed] = supabaseIdByName.current[oldName];
+      delete supabaseIdByName.current[oldName];
+    }
+    if (supabaseVersionByName.current[oldName] != null) {
+      supabaseVersionByName.current[trimmed] = supabaseVersionByName.current[oldName];
+      delete supabaseVersionByName.current[oldName];
+    }
     setScenarios(prev => {
       const next = {};
       // Preserve key order by rebuilding the object
@@ -2110,9 +847,10 @@ export default function FinancialPlanner() {
       return next;
     });
     if (activeScenario === name) setActiveScenario(Object.keys(scenarios).filter(s => s !== name)[0]);
-    // Best-effort Supabase delete + clean ref
+    // Best-effort Supabase delete + clean refs
     if (supabaseId) deleteFromSupabase(supabaseId);
     delete supabaseIdByName.current[name];
+    delete supabaseVersionByName.current[name];
   };
 
   const resetDefaults = () => {
@@ -2126,17 +864,12 @@ export default function FinancialPlanner() {
 
   // --- CRUD helpers ---
   const addAsset = () => {
-    const id = `a${Date.now()}`;
+    const id = genId("a");
     setState(s => ({ ...s, assets: [...s.assets, { id, name: "New asset", category: "cash", value: 10000, growth: 4, income: 0 }] }));
     setEditingAsset(id);
   };
-  const addOffset = () => {
-    const id = `a${Date.now()}`;
-    setState(s => ({ ...s, assets: [...s.assets, { id, name: "Offset account", category: "offset", value: 0, growth: 0, income: 0 }] }));
-    setEditingAsset(id);
-  };
   const addSuper = () => {
-    const id = `a${Date.now()}`;
+    const id = genId("a");
     setState(s => ({ ...s, assets: [...s.assets, { id, name: "Super", category: "super", value: 0, growth: 7, income: 0 }] }));
     setEditingAsset(id);
   };
@@ -2144,7 +877,7 @@ export default function FinancialPlanner() {
   const removeAsset = (id) => setState(s => ({ ...s, assets: s.assets.filter(a => a.id !== id) }));
 
   const addLiab = () => {
-    const id = `l${Date.now()}`;
+    const id = genId("l");
     setState(s => ({ ...s, liabilities: [...s.liabilities, { id, name: "New debt", balance: 0, rate: 6, type: "pi", termYears: 30 }] }));
     setEditingLiab(id);
   };
@@ -2152,7 +885,7 @@ export default function FinancialPlanner() {
   const removeLiab = (id) => setState(s => ({ ...s, liabilities: s.liabilities.filter(l => l.id !== id) }));
 
   const addEarner = () => {
-    const id = `earner${Date.now()}`;
+    const id = genId("earner");
     setState(s => ({ ...s, earners: [...s.earners, { id, name: "New earner", currency: "AUD", salary: 100000, bonusRateCash: 0, bonusRateShares: 0, salaryGrowth: 3, taxMode: "ato", taxRate: 32, hasPrivateHealth: true, superSgRate: 12.0, superSgIncludesBonus: false, superExtraConcessionalRate: 0, superExtraNonConcessionalRate: 0, superMatchConcessionalRate: 0, superMatchNonConcessionalRate: 0 }] }));
     setEditingEarner(id);
   };
@@ -2164,7 +897,7 @@ export default function FinancialPlanner() {
   }));
 
   const addKid = () => {
-    const id = `k${Date.now()}`;
+    const id = genId("k");
     setState(s => ({ ...s, kids: [...s.kids, { id, name: `Kid ${s.kids.length + 1}`, annualFees: 30000, yearsRemaining: 6, feeGrowth: 5 }] }));
     setEditingKid(id);
   };
@@ -2172,7 +905,7 @@ export default function FinancialPlanner() {
   const removeKid = (id) => setState(s => ({ ...s, kids: s.kids.filter(k => k.id !== id) }));
 
   const addEvent = () => {
-    const id = `e${Date.now()}`;
+    const id = genId("e");
     setState(s => ({ ...s, events: [...s.events, { id, name: "New event", yearOffset: 5, duration: 1, type: "expense", amount: 10000, category: "cash" }] }));
     setEditingEvent(id);
   };
@@ -2180,7 +913,7 @@ export default function FinancialPlanner() {
   const removeEvent = (id) => setState(s => ({ ...s, events: s.events.filter(e => e.id !== id) }));
 
   const addExpense = () => {
-    const id = `x${Date.now()}`;
+    const id = genId("x");
     setState(s => ({ ...s, expenses: [...(s.expenses || []), { id, name: "New expense", amount: 5000, growth: 3, startYear: 0, endYear: null }] }));
     setEditingExpense(id);
   };
@@ -2212,7 +945,6 @@ export default function FinancialPlanner() {
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Inter Tight', system-ui, sans-serif" }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&family=Inter+Tight:wght@300;400;500;600&display=swap');
         * { box-sizing: border-box; }
         body { margin: 0; }
         .serif { font-family: 'EB Garamond', Georgia, serif; }
@@ -2306,6 +1038,9 @@ export default function FinancialPlanner() {
             <button onClick={async () => {
               await supabase.auth.signOut();
               supabaseIdByName.current = {};
+              supabaseVersionByName.current = {};
+              // Don't leave financial data cached in the browser on shared machines
+              clearLocalStorage();
               setScenarios({ "Base case": DEFAULT_STATE });
               setActiveScenario("Base case");
               setLoaded(false);
@@ -2383,6 +1118,18 @@ export default function FinancialPlanner() {
             <NumberField label="Inflation %" value={state.meta.inflation} step={0.1} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, inflation: v } }))} />
             <NumberField label="FX rate (AUD per SGD)" value={state.meta.fxSgdAud ?? 1.15} step={0.01} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, fxSgdAud: v } }))} />
             <NumberField label="Retirement spending %" value={(state.meta.retirementSpendingMultiplier ?? 0.75) * 100} step={5} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, retirementSpendingMultiplier: Math.max(0, v / 100) } }))} />
+            <label style={{ display: "block" }}>
+              <div style={{ fontSize: 9, color: C.textMute, letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: 6 }}>Shortfall drawdown</div>
+              <select
+                value={state.meta.drawdown?.enabled === false ? "off" : "on"}
+                onChange={e => setState(s => ({ ...s, meta: { ...s.meta, drawdown: { superPreservationAge: 60, ...(s.meta.drawdown || {}), enabled: e.target.value === "on" } } }))}
+                style={{ background: C.bg, border: `1px solid ${C.line}`, color: C.text, padding: "8px 10px", fontSize: 13, width: "100%" }}
+              >
+                <option value="on">On — sell assets to fund deficits</option>
+                <option value="off">Off — cash can go negative</option>
+              </select>
+            </label>
+            <NumberField label="Super access age" value={state.meta.drawdown?.superPreservationAge ?? 60} onChange={v => setState(s => ({ ...s, meta: { ...s.meta, drawdown: { enabled: true, ...(s.meta.drawdown || {}), superPreservationAge: v } } }))} />
           </div>
 
           {/* Cash optimisation panel */}
@@ -2394,7 +1141,7 @@ export default function FinancialPlanner() {
           </div>
 
           <div style={{ marginTop: 12, fontSize: 10, color: C.textMute, letterSpacing: "0.05em" }}>
-            Australian tax: ATO 2025–26 progressive + 2% Medicare. Singapore: IRAS resident YA2026. Super: 15% contribs tax on concessional contributions within cap; Division 293 (extra 15%) when income + concessional contribs exceed $250k; excess concessional taxed at marginal rate. Per-earner currency, tax method, and super contribution rates are set in the Income panel.
+            Australian tax: ATO 2025–26 progressive + Medicare levy (with low-income phase-in) + MLS when no private cover. Singapore: IRAS resident YA2026. Super: 15% contribs tax on concessional contributions within cap; Division 293 (extra 15%) when income + concessional contribs exceed $250k; excess concessional taxed at marginal rate. Shortfall drawdown funds cash deficits by selling other cash, then shares, then super (once past the access age). Per-earner currency, tax method, and super contribution rates are set in the Income panel.
           </div>
         </div>
       )}
@@ -2470,10 +1217,7 @@ export default function FinancialPlanner() {
             <div style={{ height: 380 }}>
               <ResponsiveContainer width="100%" height="100%">
                 {view === "cashflow" ? (
-                  <ComposedChart data={displayedProjection} stackOffset="sign" margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
-                    onMouseMove={(e) => { if (e && e.activeLabel != null) setHoverYear(e.activeLabel); }}
-                    onMouseLeave={() => setHoverYear(null)}
-                  >
+                  <ComposedChart data={displayedProjection} stackOffset="sign" margin={{ top: 36, right: 10, left: 0, bottom: 0 }}>
                     <CartesianGrid stroke={C.line} strokeDasharray="0" vertical={false} />
                     <XAxis dataKey="year" stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(y) => `+${y}`} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} />
                     <YAxis stroke={C.textMute} tick={{ fill: C.textMute, fontSize: 10, fontFamily: "JetBrains Mono" }} tickFormatter={(v) => fmt(v)} axisLine={{ stroke: C.line }} tickLine={{ stroke: C.line }} width={60} />
@@ -2521,10 +1265,7 @@ export default function FinancialPlanner() {
                     ))}
                   </ComposedChart>
                 ) : (
-                <AreaChart data={displayedProjection} margin={{ top: 36, right: 10, left: 0, bottom: 0 }}
-                  onMouseMove={(e) => { if (e && e.activeLabel != null) setHoverYear(e.activeLabel); }}
-                  onMouseLeave={() => setHoverYear(null)}
-                >
+                <AreaChart data={displayedProjection} margin={{ top: 36, right: 10, left: 0, bottom: 0 }}>
                   <defs>
                     {CATEGORY_ORDER.map(cat => (
                       <linearGradient key={cat} id={`grad-${cat}`} x1="0" y1="0" x2="0" y2="1">
@@ -2723,7 +1464,7 @@ export default function FinancialPlanner() {
               getKey={(a) => a.id}
               onReorder={(next) => reorderAssets((a) => a.category === "super", next)}
               render={(a) => (
-                <AssetRow a={a} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
+                <AssetRow a={a} earners={state.earners}
                   editing={editingAsset === a.id}
                   onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
                   onChange={(patch) => updateAsset(a.id, patch)}
@@ -2739,7 +1480,7 @@ export default function FinancialPlanner() {
               getKey={(a) => a.id}
               onReorder={(next) => reorderAssets((a) => a.category !== "super", next)}
               render={(a) => (
-                <AssetRow a={a} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
+                <AssetRow a={a} earners={state.earners}
                   editing={editingAsset === a.id}
                   onEdit={() => setEditingAsset(editingAsset === a.id ? null : a.id)}
                   onChange={(patch) => updateAsset(a.id, patch)}
@@ -2771,7 +1512,7 @@ export default function FinancialPlanner() {
               getKey={(x) => x.id}
               onReorder={reorderExpenses}
               render={(x) => (
-                <ExpenseRow x={x} maxYear={state.meta.horizonYears} currentAge={state.meta.currentAge}
+                <ExpenseRow x={x}
                   editing={editingExpense === x.id}
                   onEdit={() => setEditingExpense(editingExpense === x.id ? null : x.id)}
                   onChange={(patch) => updateExpense(x.id, patch)}
@@ -2787,7 +1528,7 @@ export default function FinancialPlanner() {
               getKey={(l) => l.id}
               onReorder={reorderLiabilities}
               render={(l) => (
-                <LiabRow l={l} earners={state.earners} offsetAssets={state.assets.filter(x => x.category === "offset")}
+                <LiabRow l={l} earners={state.earners}
                   editing={editingLiab === l.id}
                   onEdit={() => setEditingLiab(editingLiab === l.id ? null : l.id)}
                   onChange={(patch) => updateLiab(l.id, patch)}
@@ -2801,11 +1542,11 @@ export default function FinancialPlanner() {
       )}
 
       {activeTab === "logic" && (
-        <LogicTab state={state} currentRow={currentRow} displayMode={displayMode} selectedYear={selectedYear ?? state.meta.horizonYears} setSelectedYear={setSelectedYear} />
+        <LogicTab state={state} currentRow={currentRow} selectedYear={selectedYear ?? state.meta.horizonYears} setSelectedYear={setSelectedYear} />
       )}
 
       {activeTab === "trace" && (
-        <TraceTab state={state} currentRow={currentRow} displayMode={displayMode} selectedYear={selectedYear ?? state.meta.horizonYears} setSelectedYear={setSelectedYear} projection={displayedProjection} />
+        <TraceTab state={state} currentRow={currentRow} selectedYear={selectedYear ?? state.meta.horizonYears} setSelectedYear={setSelectedYear} />
       )}
 
       <footer style={{ padding: "20px 32px", borderTop: `1px solid ${C.line}`, color: C.textMute, fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
@@ -2844,6 +1585,11 @@ export default function FinancialPlanner() {
               <button onClick={() => { confirmModal.onCancel?.(); setConfirmModal(null); }} className="fp-btn" style={btnGhost}>
                 {confirmModal.cancelLabel || "Cancel"}
               </button>
+              {confirmModal.altLabel && (
+                <button onClick={() => { confirmModal.onAlt?.(); setConfirmModal(null); }} className="fp-btn" style={btnGhost}>
+                  {confirmModal.altLabel}
+                </button>
+              )}
               <button onClick={() => { confirmModal.onConfirm?.(); setConfirmModal(null); }}
                 className="fp-btn"
                 style={{ ...btnGhost, background: C.accent, color: C.bg, borderColor: C.accent }}>
@@ -3095,6 +1841,20 @@ function CustomTooltip({ active, payload, label, events, view, categoryAssetList
             {row.netCashflow >= 0 ? "+" : ""}{fmt(row.netCashflow)}
           </span>
         </div>
+        {((row.drawdownFromCash || 0) + (row.drawdownFromEquities || 0) + (row.drawdownFromSuper || 0)) > 0 && (
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+            <span style={{ color: C.textDim }}>Drawdown (assets → cash)</span>
+            <span className="mono" style={{ color: C.accent }}>
+              {fmt((row.drawdownFromCash || 0) + (row.drawdownFromEquities || 0) + (row.drawdownFromSuper || 0))}
+            </span>
+          </div>
+        )}
+        {(row.drawdownUnmet || 0) > 0 && (
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+            <span style={{ color: C.danger }}>Unfunded shortfall</span>
+            <span className="mono" style={{ color: C.danger }}>-{fmt(row.drawdownUnmet)}</span>
+          </div>
+        )}
       </div>
       {earnerList.some(e => e.gross > 0) && (
         <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.line}` }}>
@@ -3576,7 +2336,7 @@ function KidRow({ k, editing, onEdit, onChange, onRemove }) {
   );
 }
 
-function ExpenseRow({ x, maxYear, currentAge, editing, onEdit, onChange, onRemove }) {
+function ExpenseRow({ x, editing, onEdit, onChange, onRemove }) {
   const startY = x.startYear ?? 0;
   const endY = x.endYear;
   const windowLabel = endY == null
@@ -3620,7 +2380,7 @@ function ExpenseRow({ x, maxYear, currentAge, editing, onEdit, onChange, onRemov
   );
 }
 
-function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, onRemove }) {
+function AssetRow({ a, earners, editing, onEdit, onChange, onRemove }) {
   const meta = CATEGORY_META[a.category];
   const earnerName = a.earnerId ? earners.find(e => e.id === a.earnerId)?.name : null;
   const isProperty = a.category === "primaryResidence" || a.category === "investmentProperty" || a.category === "property";
@@ -3639,7 +2399,7 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
   };
   const addLoan = () => {
     const newLoan = {
-      id: `ln${Date.now()}`,
+      id: genId("ln"),
       balance: 0, originalBalance: 0,
       rate: 6, type: "pi", termYears: 30,
       // Investment loan flag follows the property category
@@ -3817,7 +2577,7 @@ function AssetRow({ a, earners, offsetAssets = [], editing, onEdit, onChange, on
   );
 }
 
-function LiabRow({ l, earners = [], offsetAssets = [], editing, onEdit, onChange, onRemove }) {
+function LiabRow({ l, earners = [], editing, onEdit, onChange, onRemove }) {
   const ref = useClickOutside(editing, () => onEdit());
   const loanAnnual = computeAnnualPayment(l);
   const type = l.type || "pi";
@@ -4180,7 +2940,7 @@ function LogicTab({ state, currentRow, selectedYear, setSelectedYear }) {
               No active earners at this year (all retired).
             </div>
           )}
-          {earnerList.map((e, i) => <IncomeFlow key={i} e={e} state={state} />)}
+          {earnerList.map((e, i) => <IncomeFlow key={i} e={e} />)}
         </div>
       </div>
 
@@ -4190,7 +2950,7 @@ function LogicTab({ state, currentRow, selectedYear, setSelectedYear }) {
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 14 }}>
           <TaxCard earnerList={earnerList} />
           <SuperCard earnerList={earnerList} />
-          <LoanCard state={state} currentRow={currentRow} />
+          <LoanCard state={state} />
           <AssetGrowthCard state={state} year={selectedYear} />
           <ExpenseCard state={state} year={selectedYear} />
           <FxCard state={state} earnerList={earnerList} />
@@ -4239,7 +2999,7 @@ function LogicTab({ state, currentRow, selectedYear, setSelectedYear }) {
 }
 
 // Income flow diagram for a single earner
-function IncomeFlow({ e, state }) {
+function IncomeFlow({ e }) {
   if (e.retired) {
     return (
       <div style={{ background: C.panel, border: `1px solid ${C.line}`, padding: 16, color: C.textMute, fontSize: 12 }}>
@@ -4375,7 +3135,7 @@ function SuperCard({ earnerList }) {
   );
 }
 
-function LoanCard({ state, currentRow }) {
+function LoanCard({ state }) {
   const allLoans = [];
   state.assets.forEach(a => {
     (a.loans || []).forEach(l => {
@@ -4488,7 +3248,7 @@ function RatesCard({ title, rows, note }) {
 // =================================================================
 // TraceTab — line-by-line calculation trace for selected year
 // =================================================================
-function TraceTab({ state, currentRow, selectedYear, setSelectedYear, projection }) {
+function TraceTab({ state, currentRow, selectedYear, setSelectedYear }) {
   const earnerList = currentRow.earnerBreakdown ? Object.values(currentRow.earnerBreakdown) : [];
   const expenseList = currentRow.expenseBreakdown ? Object.values(currentRow.expenseBreakdown) : [];
 
@@ -4688,6 +3448,12 @@ function AuthView({ onSignedIn }) {
     fontFamily: "Inter Tight",
   };
 
+  // Link-styled buttons (real buttons so they're keyboard-focusable)
+  const authLinkStyle = {
+    background: "none", border: "none", padding: 0, font: "inherit",
+    color: C.accent, cursor: "pointer", textDecoration: "underline",
+  };
+
   return (
     <div style={{
       minHeight: "100vh", background: C.bg, color: C.text,
@@ -4695,7 +3461,6 @@ function AuthView({ onSignedIn }) {
       display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
     }}>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&family=Inter+Tight:wght@300;400;500;600&display=swap');
         body { margin: 0; }
         .serif { font-family: 'EB Garamond', Georgia, serif; }
         .mono { font-family: 'JetBrains Mono', monospace; }
@@ -4781,20 +3546,15 @@ function AuthView({ onSignedIn }) {
         <div style={{ marginTop: 20, fontSize: 11, color: C.textMute, textAlign: "center" }}>
           {mode === "signin" && (
             <>
-              <a onClick={() => { setMode("signup"); setError(null); setInfo(null); }} style={{ color: C.accent, cursor: "pointer", textDecoration: "underline" }}>Create account</a>
+              <button type="button" onClick={() => { setMode("signup"); setError(null); setInfo(null); }} style={authLinkStyle}>Create account</button>
               <span style={{ margin: "0 8px" }}>·</span>
-              <a onClick={() => { setMode("forgot"); setError(null); setInfo(null); }} style={{ color: C.accent, cursor: "pointer", textDecoration: "underline" }}>Forgot password?</a>
+              <button type="button" onClick={() => { setMode("forgot"); setError(null); setInfo(null); }} style={authLinkStyle}>Forgot password?</button>
             </>
           )}
-          {mode === "signup" && (
-            <a onClick={() => { setMode("signin"); setError(null); setInfo(null); }} style={{ color: C.accent, cursor: "pointer", textDecoration: "underline" }}>
+          {mode !== "signin" && (
+            <button type="button" onClick={() => { setMode("signin"); setError(null); setInfo(null); }} style={authLinkStyle}>
               Back to sign in
-            </a>
-          )}
-          {mode === "forgot" && (
-            <a onClick={() => { setMode("signin"); setError(null); setInfo(null); }} style={{ color: C.accent, cursor: "pointer", textDecoration: "underline" }}>
-              Back to sign in
-            </a>
+            </button>
           )}
         </div>
       </div>

@@ -1,0 +1,23 @@
+{
+  "appId": "com.benellis.ledger",
+  "appName": "The Ledger",
+  "webDir": "dist",
+  "ios": {
+    "scheme": "The Ledger",
+    "contentInset": "always",
+    "limitsNavigationsToAppBoundDomains": false,
+    "backgroundColor": "#0f0d0aff"
+  },
+  "plugins": {
+    "Keyboard": {
+      "resize": "native",
+      "style": "DARK",
+      "resizeOnFullScreen": true
+    },
+    "StatusBar": {
+      "style": "DARK",
+      "backgroundColor": "#0f0d0a",
+      "overlaysWebView": true
+    }
+  }
+}

@@ -59,6 +59,7 @@ create table public.scenarios (
   user_id uuid not null references auth.users(id) on delete cascade,
   name text not null,
   data jsonb not null,
+  version integer not null default 0,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
@@ -122,6 +123,7 @@ If clearing browser data, use **Save As** first to back up. With Supabase config
 - **Three tabs**: Planner (chart + inputs), Logic (visual flow + formula cards), Trace (line-by-line year calculation)
 - **Multiple scenarios** with rename and fork
 - **Two-earner model** with separate currencies (AUD / SGD), tax modes, super rates
+- **Retirement drawdown** — cash shortfalls are funded by selling other cash, then shares, then super (once past the super access age); configurable under Assumptions
 - **Dark editorial design** — EB Garamond + JetBrains Mono + Inter Tight, recharts, lucide-react
 
 ## Project structure
@@ -129,18 +131,81 @@ If clearing browser data, use **Save As** first to back up. With Supabase config
 ```
 financial-planner-pkg/
 ├── src/
-│   ├── App.jsx          # The whole application (one file, ~3400 lines)
+│   ├── App.jsx          # UI — components, charts, state management
+│   ├── engine.js        # Pure projection engine — tax, super, loans, migration (no React)
+│   ├── engine.test.js   # Engine regression tests (Vitest)
+│   ├── storage.js       # Persistence — Supabase, localStorage, file save/load
+│   ├── ErrorBoundary.jsx# Top-level error boundary
 │   └── main.jsx         # React entry point
 ├── index.html           # HTML shell with fonts
-├── package.json         # Dependencies
+├── package.json         # Dependencies (app version lives here too)
 ├── vite.config.js       # Dev server config
 ├── .env.example         # Template — copy to .env and fill in
 ├── .gitignore           # Ignores node_modules, .env, etc.
 └── README.md            # This file
 ```
 
+## Tests
+
+The projection engine (tax brackets, Medicare levy + surcharge, super caps, Div 293,
+loan amortisation, scenario migration, retirement drawdown) is covered by unit tests:
+
+```bash
+npm test
+```
+
+## Running on iPad / iPhone (native, via Capacitor)
+
+The same React code is wrapped as a real iOS app using [Capacitor](https://capacitorjs.com). You'll need macOS + Xcode + an Apple ID.
+
+### One-time setup
+
+1. Install Xcode from the Mac App Store
+2. Open Xcode once and accept the license; install any prompted simulator runtimes
+3. (Optional, for plugins that need it) Install CocoaPods: `brew install cocoapods`
+
+### Build and open in Xcode
+
+```bash
+npm run ios
+```
+
+This runs `vite build`, copies the bundle into `ios/App/App/public/`, and opens the Xcode project. Then in Xcode:
+
+1. Select a simulator (e.g. "iPhone 16 Pro") or a connected device from the run-target dropdown
+2. Click the **Run** button (▶) or press **Cmd-R**
+3. First build downloads simulator runtime if needed; subsequent runs are fast
+
+### Running on a physical iPhone / iPad
+
+1. Connect the device via USB and trust this Mac when prompted
+2. In Xcode → **Signing & Capabilities**, sign in with your Apple ID and pick a team (free personal team works)
+3. Change the **Bundle Identifier** if `com.benellis.ledger` is already taken on your Apple ID
+4. Select the device as the run target and click **Run**
+5. On first launch, the iPhone will refuse to open the app — go to **Settings → General → VPN & Device Management** on the iPhone and trust the developer profile
+
+### Daily workflow
+
+After editing React code:
+
+```bash
+npm run ios:sync    # rebuild + copy into iOS without opening Xcode
+```
+
+Then in Xcode just hit **Run** again. Or use the all-in-one:
+
+```bash
+npm run ios         # build + sync + open Xcode
+```
+
+### Supabase auth caveat
+
+Email confirmation links from Supabase redirect to your project's **Site URL** (set in Supabase dashboard). In the native iOS app that means the link opens Safari, not the app. After confirming in Safari, switch back to the app and sign in — the session is then stored locally in the WebView.
+
+For a true deep-link redirect (`yourapp://`) back to the native app, add `@capacitor/app` URL listeners and configure a custom URL scheme in `ios/App/App/Info.plist`. Not required for basic usage.
+
 ## Requirements
 
 - Node.js 18+
-- macOS, Linux, or Windows
+- macOS, Linux, or Windows (iOS build requires macOS + Xcode)
 - Modern browser (Chrome, Safari, Firefox, Edge — recent versions)
